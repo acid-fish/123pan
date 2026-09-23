@@ -9,6 +9,7 @@ the Free Software Foundation, either version 3 of the License, or
 """
 
 from PySide6.QtCore import QThreadPool, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QAbstractScrollArea, QDialog, QMenu, QSystemTrayIcon
 
 import sys
@@ -54,8 +55,9 @@ class MainWindow(FluentWindow):
         super().__init__()
         #self.stackedWidget.setAnimationEnabled(False)
         self.setWindowTitle("123pan")
-        self.resize(900, 600)
+        self.resize(1200, 800)
         self.setMinimumSize(760, 520)
+        self._center_on_first_show = True
         logger.info("MainWindow 初始化")
 
         # Linux 下禁用 Mica 效果，避免 "This plugin does not support setting window opacity" 错误
@@ -128,6 +130,23 @@ class MainWindow(FluentWindow):
         self._startup_login_flow()
         self._initNavigation()
         logger.info("MainWindow 初始化完成")
+
+    def showEvent(self, event):
+        """首次显示时居中；从托盘恢复时保留用户调整后的位置。"""
+        super().showEvent(event)
+        if not self._center_on_first_show:
+            return
+        self._center_on_first_show = False
+        self.__center_on_primary_screen()
+
+    def __center_on_primary_screen(self):
+        """按主屏幕可用区域居中主窗口。"""
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        frame = self.frameGeometry()
+        frame.moveCenter(screen.availableGeometry().center())
+        self.move(frame.topLeft())
 
     def _initNavigation(self):
         self.addSubInterface(self.file_interface, FIF.FOLDER, tr("nav.file", "文件"))
