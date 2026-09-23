@@ -46,20 +46,27 @@ def _mock_upload_session():
                     "Reuse": False,
                     "Bucket": "nb", "StorageNode": "ns", "Key": "nk",
                     "UploadId": "nu", "FileId": 7,
+                    "SliceSize": "5242880",
                 },
             })
         if "s3_list_upload_parts" in url:
             return MockResponse({"code": 0, "data": {"parts": []}})
+        if "s3_upload_object/auth" in url:
+            return MockResponse(
+                {"code": 0, "data": {"presignedUrls": {
+                    str(i): f"http://cdn/{i}" for i in range(1, 16)
+                }}}
+            )
         if "s3_repare_upload_parts_batch" in url:
             return MockResponse(
                 {"code": 0, "data": {"presignedUrls": {
                     str(i): f"http://cdn/{i}" for i in range(1, 16)
                 }}}
             )
-        if "s3_complete_multipart_upload" in url:
-            return MockResponse({"code": 0})
-        if "upload_complete" in url:
-            return MockResponse({"code": 0})
+        if "upload_complete/v2" in url:
+            return MockResponse(
+                {"code": 0, "data": {"file_info": {"FileId": 7, "FileName": "f.bin"}}}
+            )
         return MockResponse({"code": 0})
 
     session.http.post.side_effect = _post_side_effect

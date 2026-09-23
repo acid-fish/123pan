@@ -50,6 +50,7 @@ def _mock_upload_session(uploaded_parts=None):
                     "Reuse": False,
                     "Bucket": "nb", "StorageNode": "ns", "Key": "nk",
                     "UploadId": "nu", "FileId": 7,
+                    "SliceSize": str(BLOCK),
                 },
             })
         if "s3_list_upload_parts" in url:
@@ -58,16 +59,22 @@ def _mock_upload_session(uploaded_parts=None):
                     {"PartNumber": pn} for pn in uploaded_parts
                 ]}}
             )
+        if "s3_upload_object/auth" in url:
+            return MockResponse(
+                {"code": 0, "data": {"presignedUrls": {
+                    str(i): f"http://cdn/{i}" for i in range(1, 32)
+                }}}
+            )
         if "s3_repare_upload_parts_batch" in url:
             return MockResponse(
                 {"code": 0, "data": {"presignedUrls": {
                     str(i): f"http://cdn/{i}" for i in range(1, 32)
                 }}}
             )
-        if "s3_complete_multipart_upload" in url:
-            return MockResponse({"code": 0})
-        if "upload_complete" in url:
-            return MockResponse({"code": 0})
+        if "upload_complete/v2" in url:
+            return MockResponse(
+                {"code": 0, "data": {"file_info": {"FileId": 7, "FileName": "f.bin"}}}
+            )
         return MockResponse({"code": 0})
 
     session.http.post.side_effect = _post_side_effect
@@ -128,15 +135,16 @@ class TestUploadParallel:
 
     def test_parallel_resume_skips_uploaded(self, tmp_path):
         """并行续传：跳过已上传分片 1/2，只上传分片 3。"""
+        big_block = 16777216  # 新协议分片大小
         f = tmp_path / "f.bin"
-        f.write_bytes(b"A" * BLOCK * 3)
+        f.write_bytes(b"A" * big_block * 3)
         session = _mock_upload_session(uploaded_parts=[1, 2])
         svc = UploadService(session)
         resume_info = {
             "bucket": "b", "storage_node": "s", "upload_key": "k",
             "upload_id": "u", "up_file_id": 9,
             "file_mtime": f.stat().st_mtime, "file_size": f.stat().st_size,
-            "block_size": BLOCK,
+            "block_size": big_block,
         }
 
         result = svc.up_load(str(f), 0, resume_info=resume_info, num_threads=2)
@@ -220,25 +228,25 @@ class TestUploadParallel:
         assert session.transfer.put.call_count == 1
 
     def test_complete_failure_is_not_reported_as_success(self, tmp_path):
-        """服务端合并失败时抛错，不能继续确认上传完成。"""
+        """服务端完成确认失败时抛错，不能把上传报为成功。"""
         f = tmp_path / "f.bin"
         f.write_bytes(b"A" * BLOCK)
         session = _mock_upload_session()
         original_post = session.http.post.side_effect
 
         def _post_side_effect(url, *args, **kwargs):
-            if "s3_complete_multipart_upload" in str(url):
+            if "upload_complete/v2" in str(url):
                 return MockResponse({"code": 5001, "message": "merge failed"})
             return original_post(url, *args, **kwargs)
 
         session.http.post.side_effect = _post_side_effect
         svc = UploadService(session)
 
-        with pytest.raises(RuntimeError, match="合并上传分片失败"):
+        with pytest.raises(RuntimeError, match="上传完成确认失败"):
             svc.up_load(str(f), 0)
 
         urls = [str(c.args[0]) for c in session.http.post.call_args_list]
-        assert not any("upload_complete" in url for url in urls)
+        assert any("upload_complete/v2" in url for url in urls)
 
 
 class TestFormatSpeed:

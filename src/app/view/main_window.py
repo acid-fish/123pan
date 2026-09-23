@@ -28,6 +28,8 @@ from ..common.i18n import tr
 from ..tasks.file_tasks import AutoLoginTask, connect_tracked
 from ..tasks.signals import _AutoLoginSignals
 from ..tasks.sync_manager import SyncManager
+from ..tasks.bi_sync_manager import BiSyncManager
+from .icons import BISYNC_ICON
 
 logger = get_logger(__name__)
 
@@ -70,6 +72,8 @@ class MainWindow(FluentWindow):
 
         # 全局同步调度器：独立于界面存在，托盘/后台运行期间仍按频率同步
         self._sync_manager = SyncManager(self)
+        # 全局双向同步调度器：独立存储/线程，与单向同步互不影响；登录后静默同步
+        self._bi_sync_manager = BiSyncManager(self)
         # 是否已登录（控制关闭窗口时是否最小化到托盘）
         self._logged_in = False
         # 强制退出标记（托盘菜单「退出」绕过最小化到托盘）
@@ -96,6 +100,9 @@ class MainWindow(FluentWindow):
             ),
             "SyncInterface": (
                 FIF.UPDATE, tr("nav.sync", "同步"), NavigationItemPosition.TOP,
+            ),
+            "BiSyncInterface": (
+                BISYNC_ICON, tr("nav.bisync", "双向同步"), NavigationItemPosition.TOP,
             ),
             "TrashInterface": (
                 FIF.DELETE, tr("nav.trash", "回收站"), NavigationItemPosition.TOP,
@@ -182,6 +189,9 @@ class MainWindow(FluentWindow):
         elif route_key == "SyncInterface":
             from .sync_interface import SyncInterface
             interface = SyncInterface(self._sync_manager, pan=self.pan, parent=self)
+        elif route_key == "BiSyncInterface":
+            from .bi_sync_interface import BiSyncInterface
+            interface = BiSyncInterface(self._bi_sync_manager, pan=self.pan, parent=self)
         elif route_key == "settingInterface":
             from .setting_interface import SettingInterface
             interface = SettingInterface(self)
@@ -266,6 +276,7 @@ class MainWindow(FluentWindow):
         """登录成功后同步 pan 到各子界面。"""
         self._logged_in = True
         self._sync_manager.set_pan(self.pan)
+        self._bi_sync_manager.set_pan(self.pan)
         self.file_interface.pan = self.pan
         self._sync_pan_to_interfaces()
         self.__ensure_tray()
@@ -317,6 +328,7 @@ class MainWindow(FluentWindow):
             logger.debug("确认退出登录")
             self._logged_in = False
             self._sync_manager.clear_pan()
+            self._bi_sync_manager.clear_pan()
             self.clear_login_config()
             dlg = LoginDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -339,12 +351,14 @@ class MainWindow(FluentWindow):
         dlg = LoginDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._sync_manager.clear_pan()
+            self._bi_sync_manager.clear_pan()
             self.pan = dlg.get_pan()
             logger.info(
                 "切换账号成功: %s",
                 self.pan.user_name if hasattr(self.pan, "user_name") else "?",
             )
             self._sync_manager.set_pan(self.pan)
+            self._bi_sync_manager.set_pan(self.pan)
             self._sync_pan_to_interfaces()
         else:
             logger.debug("用户取消切换账号")
@@ -380,10 +394,12 @@ class MainWindow(FluentWindow):
             FIF.CLOSE.icon(), tr("tray.quit", "退出")
         )
 
+        def run_all_sync():
+            self._sync_manager.run_all_enabled()
+            self._bi_sync_manager.run_all_enabled()
+
         show_action.triggered.connect(self.show_from_tray)
-        sync_action.triggered.connect(
-            lambda: self._sync_manager.run_all_enabled()
-        )
+        sync_action.triggered.connect(run_all_sync)
         open_sync_action.triggered.connect(
             lambda: self._open_interface("SyncInterface")
         )
@@ -441,6 +457,7 @@ class MainWindow(FluentWindow):
         if transfer is not None:
             transfer.shutdown()
         self._sync_manager.shutdown()
+        self._bi_sync_manager.shutdown()
         if self._tray is not None:
             self._tray.hide()
         super().closeEvent(event)

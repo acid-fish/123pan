@@ -26,6 +26,11 @@ _UPLOAD_REQUEST_TIMEOUT = 15
 _UPLOAD_PART_TIMEOUT = 120
 _UPLOAD_PART_RETRIES = 5
 _MAX_UPLOAD_THREADS = 4
+# 分片大小：新上传协议固定 16MB（实际以 upload_request 返回的 SliceSize 为准）
+_SLICE_SIZE = 16777216
+# 完成确认（upload_complete/v2）无 file_info 时的重试次数与间隔（秒）
+_UPLOAD_COMPLETE_RETRIES = 3
+_UPLOAD_COMPLETE_RETRY_DELAY = 3
 
 
 class UploadService:
@@ -184,6 +189,37 @@ class UploadService:
             raise RuntimeError(f"获取分片 {part_number} 预签名 URL 失败")
         return urls[part_number]
 
+    def _fetch_auth_presigned_url(
+        self, bucket, upload_key, upload_id, storage_node, part_number,
+        refresh_session=None, refresh_state=None,
+    ):
+        """获取单分片（单块上传）的预签名 URL。
+
+        新上传协议：单块文件（文件大小 ≤ 一个分片）走
+        s3_upload_object/auth 端点，多块走 s3_repare_upload_parts_batch。
+        """
+        get_link_data = {
+            "StorageNode": storage_node,
+            "bucket": bucket,
+            "key": upload_key,
+            "partNumberEnd": part_number + 1,
+            "partNumberStart": part_number,
+            "uploadId": upload_id,
+        }
+        _, get_link_res_json = self._post_with_session_retry(
+            refresh_session, refresh_state,
+            api_url("/b/api/file/s3_upload_object/auth"),
+            get_link_data, _UPLOAD_REQUEST_TIMEOUT,
+        )
+        res_code_up = get_link_res_json.get("code", -1)
+        if res_code_up != 0:
+            raise RuntimeError(f"获取上传认证失败: {get_link_res_json}")
+        presigned = (get_link_res_json.get("data") or {}).get("presignedUrls") or {}
+        url = presigned.get(str(part_number))
+        if not url:
+            raise RuntimeError(f"获取分片 {part_number} 预签名 URL 失败")
+        return url
+
     def _put_part_with_retry(self, upload_url, data, task=None):
         """上传分片并重试临时网络错误。"""
         last_error = None
@@ -264,7 +300,7 @@ class UploadService:
         )
 
         t0 = time.monotonic()
-        block_size = 5242880
+        block_size = _SLICE_SIZE
         refresh_state = {
             "attempted": False,
             "succeeded": False,
@@ -276,6 +312,15 @@ class UploadService:
 
         # 校验续传信息：文件未变化时复用既有 S3 会话
         resume = self._validate_resume_info(resume_info, file_path_obj, fsize)
+
+        if resume:
+            # 分片大小与当前协议不一致 → 旧会话作废（分片边界不兼容），重新上传
+            if int(resume.get("block_size") or 0) != _SLICE_SIZE:
+                logger.info(
+                    "续传会话分片大小不匹配(%s != %s)，重新上传: %s",
+                    resume.get("block_size"), _SLICE_SIZE, file_name,
+                )
+                resume = None
 
         if resume:
             bucket = resume["bucket"]
@@ -342,6 +387,13 @@ class UploadService:
             upload_key = up_res_json["data"]["Key"]
             upload_id = up_res_json["data"]["UploadId"]
             up_file_id = up_res_json["data"]["FileId"]
+
+            # 分片大小以服务端返回的 SliceSize 为准（新协议为 16MB），
+            # 异常值（缺失/过小）回退到 16MB
+            slice_size = int(
+                (up_res_json["data"].get("SliceSize") or 0) or _SLICE_SIZE
+            )
+            block_size = max(slice_size, 5 * 1024 * 1024)
 
             # 回调持久化 S3 会话，供中断后断点续传
             if session_callback:
@@ -534,9 +586,16 @@ class UploadService:
                                     break
                                 time.sleep(min(remaining, 0.1))
 
-                    upload_url = self._fetch_single_presigned_url(
-                        bucket, upload_key, upload_id, storage_node, part_number,
-                        refresh_session, refresh_state,
+                    upload_url = (
+                        self._fetch_auth_presigned_url(
+                            bucket, upload_key, upload_id, storage_node, part_number,
+                            refresh_session, refresh_state,
+                        )
+                        if total_parts == 1
+                        else self._fetch_single_presigned_url(
+                            bucket, upload_key, upload_id, storage_node, part_number,
+                            refresh_session, refresh_state,
+                        )
                     )
                     if not self._put_part_with_retry(upload_url, data, task):
                         return "已取消"
@@ -544,40 +603,47 @@ class UploadService:
                     _report_progress()
                     part_number += 1
 
-        uploaded_comp_data = {
+        # 完成上传：新协议 upload_complete/v2 一次完成合并与注册。
+        # （旧协议的 s3_complete_multipart_upload + upload_complete 已被
+        # 服务端废弃：接口返回成功但文件不会出现在目录中。）
+        is_multipart = total_parts > 1
+        complete_data = {
+            "StorageNode": storage_node,
             "bucket": bucket,
+            "fileId": up_file_id,
+            "fileSize": fsize,
+            "isMultipart": is_multipart,
             "key": upload_key,
             "uploadId": upload_id,
-            "storageNode": storage_node,
         }
-        _, parts_res_json = self._post_with_session_retry(
-            refresh_session, refresh_state,
-            api_url("/b/api/file/s3_list_upload_parts"),
-            uploaded_comp_data, 30,
+        file_info = {}
+        for attempt in range(1, _UPLOAD_COMPLETE_RETRIES + 1):
+            _, complete_res_json = self._post_with_session_retry(
+                refresh_session, refresh_state,
+                api_url("/b/api/file/upload_complete/v2"),
+                complete_data, 60,
+            )
+            if complete_res_json.get("code", -1) != 0:
+                raise RuntimeError(f"上传完成确认失败: {complete_res_json}")
+            file_info = (complete_res_json.get("data") or {}).get("file_info") or {}
+            if file_info:
+                break
+            # 服务端偶发未注册（code=0 但无 file_info）：延迟后重试确认
+            if attempt < _UPLOAD_COMPLETE_RETRIES:
+                logger.warning(
+                    "上传完成确认缺少文件信息，%ds 后重试(%d/%d): %s",
+                    _UPLOAD_COMPLETE_RETRY_DELAY, attempt,
+                    _UPLOAD_COMPLETE_RETRIES, file_name,
+                )
+                time.sleep(_UPLOAD_COMPLETE_RETRY_DELAY)
+        if not file_info:
+            raise RuntimeError(
+                f"上传完成确认失败（服务端未注册文件）: {complete_res_json}"
+            )
+        logger.debug(
+            "上传完成确认: %s (FileId=%s)",
+            file_name, file_info.get("FileId"),
         )
-        if parts_res_json.get("code", -1) != 0:
-            raise RuntimeError(f"上传分片列表确认失败: {parts_res_json}")
-
-        _, complete_res_json = self._post_with_session_retry(
-            refresh_session, refresh_state,
-            api_url("/b/api/file/s3_complete_multipart_upload"),
-            uploaded_comp_data, 30,
-        )
-        if complete_res_json.get("code", -1) != 0:
-            raise RuntimeError(f"合并上传分片失败: {complete_res_json}")
-
-        if fsize > 64 * 1024 * 1024:
-            time.sleep(3)
-
-        close_up_session_data = {"fileId": up_file_id}
-        _, close_res_json = self._post_with_session_retry(
-            refresh_session, refresh_state,
-            api_url("/b/api/file/upload_complete"),
-            close_up_session_data, 30,
-        )
-        res_code_up = close_res_json.get("code", -1)
-        if res_code_up != 0:
-            raise RuntimeError(f"上传完成确认失败: {close_res_json}")
 
         elapsed = time.monotonic() - t0
         speed = fsize / 1024 / 1024 / elapsed if elapsed > 0 else 0

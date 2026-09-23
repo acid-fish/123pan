@@ -173,6 +173,49 @@ class Database:
                     mtime    INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (job_id, rel_path)
                 );
+
+                CREATE TABLE IF NOT EXISTS bi_sync_jobs (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name              TEXT NOT NULL,
+                    local_path        TEXT NOT NULL,
+                    remote_dir_id     INTEGER NOT NULL DEFAULT 0,
+                    remote_dir_name   TEXT NOT NULL DEFAULT '',
+                    interval_seconds  INTEGER NOT NULL DEFAULT 0,
+                    enabled           INTEGER NOT NULL DEFAULT 1,
+                    delete_remote     INTEGER NOT NULL DEFAULT 0,
+                    delete_local      INTEGER NOT NULL DEFAULT 0,
+                    conflict_policy   TEXT NOT NULL DEFAULT 'keep_both',
+                    sync_on_startup   INTEGER NOT NULL DEFAULT 1,
+                    last_run_at       TEXT NOT NULL DEFAULT '',
+                    created_at        TEXT NOT NULL,
+                    updated_at        TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bi_sync_history (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id      INTEGER NOT NULL DEFAULT 0,
+                    job_name    TEXT NOT NULL DEFAULT '',
+                    started_at  TEXT NOT NULL,
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    added       INTEGER NOT NULL DEFAULT 0,
+                    updated     INTEGER NOT NULL DEFAULT 0,
+                    downloaded  INTEGER NOT NULL DEFAULT 0,
+                    deleted     INTEGER NOT NULL DEFAULT 0,
+                    conflicts   INTEGER NOT NULL DEFAULT 0,
+                    failed      INTEGER NOT NULL DEFAULT 0,
+                    status      TEXT NOT NULL DEFAULT 'completed',
+                    message     TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS bi_sync_state (
+                    job_id          INTEGER NOT NULL,
+                    rel_path        TEXT NOT NULL,
+                    local_size      INTEGER NOT NULL DEFAULT 0,
+                    local_mtime     INTEGER,
+                    remote_size     INTEGER NOT NULL DEFAULT 0,
+                    remote_updateat INTEGER,
+                    PRIMARY KEY (job_id, rel_path)
+                );
                 """
             )
             self._conn.commit()

@@ -80,16 +80,20 @@ class TestUploadResume:
                 return MockResponse(
                     {"code": 0, "data": {"parts": [{"PartNumber": 1}]}}
                 )
+            if "s3_upload_object/auth" in url:
+                return MockResponse(
+                    {"code": 0, "data": {"presignedUrls": {"1": "http://cdn/1"}}}
+                )
             if "s3_repare_upload_parts_batch" in url:
                 return MockResponse(
                     {"code": 0, "data": {"presignedUrls": {
                         "2": "http://cdn/2", "3": "http://cdn/3", "4": "http://cdn/4"
                     }}}
                 )
-            if "s3_complete_multipart_upload" in url:
-                return MockResponse({"code": 0})
-            if "upload_complete" in url:
-                return MockResponse({"code": 0})
+            if "upload_complete/v2" in url:
+                return MockResponse(
+                    {"code": 0, "data": {"file_info": {"FileId": 9, "FileName": "f.bin"}}}
+                )
             return MockResponse({"code": 0})
 
         session.http.post.side_effect = _post_side_effect
@@ -98,8 +102,9 @@ class TestUploadResume:
 
     def test_resume_skips_upload_request(self, tmp_path):
         """续传时不调用 upload_request，且跳过已上传分片。"""
+        big_block = 16777216  # 新协议分片大小
         f = tmp_path / "f.bin"
-        f.write_bytes(b"A" * BLOCK * 2 + b"B" * 100)  # 2 完整块 + 1 部分块
+        f.write_bytes(b"A" * big_block * 2 + b"B" * 100)  # 2 完整块 + 1 部分块
         session = self._mock_session()
         svc = UploadService(session)
 
@@ -107,7 +112,7 @@ class TestUploadResume:
             "bucket": "b", "storage_node": "s", "upload_key": "k",
             "upload_id": "u", "up_file_id": 9,
             "file_mtime": f.stat().st_mtime, "file_size": f.stat().st_size,
-            "block_size": BLOCK,
+            "block_size": big_block,
         }
         result = svc.up_load(str(f), 0, resume_info=resume_info)
         assert result == 9
@@ -143,18 +148,23 @@ class TestUploadResume:
                         "Reuse": False,
                         "Bucket": "nb", "StorageNode": "ns", "Key": "nk",
                         "UploadId": "nu", "FileId": 7,
+                        "SliceSize": str(BLOCK),
                     },
                 })
             if "s3_list_upload_parts" in url:
                 return MockResponse({"code": 0, "data": {"parts": []}})
+            if "s3_upload_object/auth" in url:
+                return MockResponse(
+                    {"code": 0, "data": {"presignedUrls": {"1": "http://cdn/1"}}}
+                )
             if "s3_repare_upload_parts_batch" in url:
                 return MockResponse(
                     {"code": 0, "data": {"presignedUrls": {"1": "http://cdn/1"}}}
                 )
-            if "s3_complete_multipart_upload" in url:
-                return MockResponse({"code": 0})
-            if "upload_complete" in url:
-                return MockResponse({"code": 0})
+            if "upload_complete/v2" in url:
+                return MockResponse(
+                    {"code": 0, "data": {"file_info": {"FileId": 7, "FileName": "g.bin"}}}
+                )
             return MockResponse({"code": 0})
 
         session.http.post.side_effect = _post_side_effect
@@ -195,6 +205,7 @@ class TestUploadResume:
             "bucket": "b", "storage_node": "s", "upload_key": "k",
             "upload_id": "u", "up_file_id": 9,
             "file_mtime": f.stat().st_mtime, "file_size": f.stat().st_size,
+            "block_size": 16777216,
         }
         refresh_session = MagicMock(return_value=200)
 

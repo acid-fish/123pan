@@ -88,10 +88,20 @@ class TestComputeFileMd5Progress:
                         "UploadId": "u", "FileId": 1,
                     },
                 })
+            if "s3_upload_object/auth" in url:
+                return MagicMock(json=lambda: {
+                    "code": 0,
+                    "data": {"presignedUrls": {"1": "http://cdn/1"}},
+                })
             if "s3_repare_upload_parts_batch" in url:
                 return MagicMock(json=lambda: {
                     "code": 0,
                     "data": {"presignedUrls": {"1": "http://cdn/1"}},
+                })
+            if "upload_complete/v2" in url:
+                return MagicMock(json=lambda: {
+                    "code": 0,
+                    "data": {"file_info": {"FileId": 1, "FileName": "f.bin"}},
                 })
             return MagicMock(json=lambda: {"code": 0})
 
