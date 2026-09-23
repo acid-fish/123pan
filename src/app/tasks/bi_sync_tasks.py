@@ -9,11 +9,19 @@ the Free Software Foundation, either version 3 of the License, or
 """
 
 from datetime import datetime, timezone
+from uuid import uuid4
 
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, Signal
 
+from ..common.bi_sync_events import (
+    BiSyncEventType,
+    BiSyncItemStatus,
+    BiSyncRunEvent,
+    BiSyncServiceEvent,
+)
 from ..common.bi_sync_store import BiSyncStore
 from ..common.i18n import tr
+from ..common.local_trash import move_to_system_trash
 from ..common.log import get_logger
 from ..service.bi_sync_service import (
     PHASE_PULL,
@@ -32,15 +40,19 @@ logger = get_logger(__name__)
 class BiSyncRunThread(QThread):
     """双向同步运行线程：在后台执行一次完整双向同步。
 
-    通过 _SyncJobSignals 将进度/状态/结果发射回主线程。
+    保留 _SyncJobSignals 的旧进度契约，并通过 runEvent 提供完整运行详情。
     支持 cancel() 中止（上传在分片边界、下载通过 cancel_event 及时停止）。
     """
 
-    def __init__(self, pan, job, signals):
+    runEvent = Signal(object)
+
+    def __init__(self, pan, job, signals, local_trash=move_to_system_trash):
         super().__init__()
         self._pan = pan
         self._job = job
         self.signals = signals
+        self._local_trash = local_trash
+        self._run_id = uuid4().hex
         self._cancel = False
 
     @property
@@ -62,6 +74,16 @@ class BiSyncRunThread(QThread):
         }
         store = BiSyncStore()
 
+        def _run_event(event):
+            self.runEvent.emit(
+                BiSyncRunEvent(
+                    run_id=self._run_id,
+                    job_id=job_id,
+                    job_name=job_name,
+                    event=event,
+                )
+            )
+
         def _progress(rel_path, current, total, phase):
             if rel_path:
                 self.signals.file_progress.emit(job_id, rel_path, current, total)
@@ -75,12 +97,18 @@ class BiSyncRunThread(QThread):
                 }.get(phase, phase)
                 self.signals.status.emit(job_id, phase_text)
 
+        _run_event(BiSyncServiceEvent(event_type=BiSyncEventType.RUN_STARTED))
         try:
-            service = BiSyncService(self._pan._session, self._pan.user_name)
+            service = BiSyncService(
+                self._pan._session,
+                self._pan.user_name,
+                local_trash=self._local_trash,
+            )
             success, stats = service.run_bi_sync(
                 self._job, progress_callback=_progress, cancel=self,
                 # token 过期时自动重登（与 UI 上传路径一致）
                 refresh_session=self._pan.login,
+                event_callback=_run_event,
             )
             cancelled = self.is_cancelled
 
@@ -92,13 +120,40 @@ class BiSyncRunThread(QThread):
                 status = "failed"
 
             summary = self._build_summary(stats, cancelled)
-            self.signals.finished.emit(
-                job_id, success and not cancelled, summary, stats
+            run_success = success and not cancelled
+            run_status = (
+                BiSyncItemStatus.CANCELLED
+                if cancelled
+                else (
+                    BiSyncItemStatus.COMPLETED
+                    if run_success
+                    else BiSyncItemStatus.FAILED
+                )
             )
+            _run_event(
+                BiSyncServiceEvent(
+                    event_type=BiSyncEventType.RUN_FINISHED,
+                    status=run_status,
+                    success=run_success,
+                    summary=summary,
+                    stats=dict(stats),
+                )
+            )
+            self.signals.finished.emit(job_id, run_success, summary, stats)
             self._record_history(store, job_id, job_name, started_at, status, stats)
         except Exception as e:
             logger.error("双向同步运行异常: job=%s, err=%s", job_name, e)
             summary = tr("bisync.error_run", "同步失败: {}").format(e)
+            _run_event(
+                BiSyncServiceEvent(
+                    event_type=BiSyncEventType.RUN_FINISHED,
+                    status=BiSyncItemStatus.FAILED,
+                    success=False,
+                    summary=summary,
+                    stats=dict(stats),
+                    message=str(e),
+                )
+            )
             self.signals.finished.emit(job_id, False, summary, stats)
             self._record_history(
                 store, job_id, job_name, started_at, "failed", stats, message=str(e)
@@ -125,6 +180,10 @@ class BiSyncRunThread(QThread):
                 tr("bisync.sum_deleted", "删除 {}").format(
                     stats["deleted_remote"] + stats["deleted_local"]
                 )
+            )
+        if stats.get("skipped", 0):
+            parts.append(
+                tr("bisync.sum_skipped", "保留 {}").format(stats["skipped"])
             )
         if stats["failed"]:
             parts.append(tr("bisync.sum_failed", "失败 {}").format(stats["failed"]))

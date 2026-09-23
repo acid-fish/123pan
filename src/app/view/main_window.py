@@ -21,6 +21,7 @@ from qfluentwidgets import (
 )
 from .file_interface import FileInterface
 from .login_window import LoginDialog
+from .bi_sync_progress_dialog import BiSyncProgressController
 
 from ..common.config import ConfigManager
 from ..common.log import get_logger
@@ -74,6 +75,10 @@ class MainWindow(FluentWindow):
         self._sync_manager = SyncManager(self)
         # 全局双向同步调度器：独立存储/线程，与单向同步互不影响；登录后静默同步
         self._bi_sync_manager = BiSyncManager(self)
+        # 详情窗口独立于懒加载页面，启动静默同步时主窗口隐藏也能显示
+        self._bi_sync_progress_controller = BiSyncProgressController(
+            self._bi_sync_manager, self
+        )
         # 是否已登录（控制关闭窗口时是否最小化到托盘）
         self._logged_in = False
         # 强制退出标记（托盘菜单「退出」绕过最小化到托盘）
@@ -458,6 +463,7 @@ class MainWindow(FluentWindow):
             transfer.shutdown()
         self._sync_manager.shutdown()
         self._bi_sync_manager.shutdown()
+        self._bi_sync_progress_controller.shutdown()
         if self._tray is not None:
             self._tray.hide()
         super().closeEvent(event)

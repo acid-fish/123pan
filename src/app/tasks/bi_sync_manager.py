@@ -8,7 +8,7 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 
 from ..common.bi_sync_store import BiSyncStore
 from ..common.log import get_logger
@@ -28,6 +28,8 @@ class BiSyncManager(SyncManager):
       用于 B 机开机自动登录后静默拉取云端内容到本地
     - 定时调度、托盘「立即同步」、退出清理均与单向同步行为一致
     """
+
+    jobRunEvent = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -65,6 +67,7 @@ class BiSyncManager(SyncManager):
         signals.status.connect(self.jobStatusChanged.emit)
         signals.file_progress.connect(self.jobFileProgress.emit)
         signals.file_done.connect(self.jobFileDone.emit)
+        thread.runEvent.connect(self.jobRunEvent.emit)
         signals.finished.connect(
             lambda jid, ok, summary, stats: self._on_job_finished(
                 jid, ok, summary, stats, thread

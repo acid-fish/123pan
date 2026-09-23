@@ -166,13 +166,19 @@ class BiSyncJobDialog(QDialog):
 
         # 删除本地多余文件
         self.deleteLocalCheck = CheckBox(
-            tr("bisync.delete_local", "云端删除时同步删除本地文件"), self
+            tr(
+                "bisync.delete_local",
+                "云端删除时将本地文件移入系统回收站",
+            ),
+            self,
         )
         self.deleteLocalCheck.setChecked(bool((job or {}).get("delete_local")))
         self.deleteLocalCheck.setToolTip(
             tr(
                 "bisync.delete_local_tip",
-                "启用后，云端已删除的文件会在下次同步时删除本地对应文件（慎用）",
+                "启用后，云端已删除的文件会在下次同步时移入系统回收站；"
+                "空目录仅在确认为空时清理。回收站不可用时同步会报错，"
+                "不会永久删除文件。",
             )
         )
         layout.addWidget(self.deleteLocalCheck)
@@ -204,8 +210,8 @@ class BiSyncJobDialog(QDialog):
         self.syncOnStartupCheck.setToolTip(
             tr(
                 "bisync.sync_on_startup_tip",
-                "启用后，软件登录成功即自动在后台静默同步一次（无需手动触发），"
-                "适合下班后在另一台电脑上自动拉取云端最新内容",
+                "启用后，软件登录成功即自动同步一次；主界面保持隐藏，"
+                "但会显示可操作的同步详情窗口。",
             )
         )
         layout.addWidget(self.syncOnStartupCheck)

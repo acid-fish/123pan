@@ -12,6 +12,11 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from src.app.common.bi_sync_events import (
+    BiSyncAction,
+    BiSyncEventType,
+    BiSyncItemStatus,
+)
 from src.app.common.bi_sync_store import (
     CONFLICT_KEEP_BOTH,
     CONFLICT_LOCAL_WINS,
@@ -19,6 +24,7 @@ from src.app.common.bi_sync_store import (
     BiSyncStore,
 )
 from src.app.service.bi_sync_service import BiSyncService
+from src.app.service.download_service import DownloadLinkError
 
 
 class _DummySession:
@@ -28,8 +34,8 @@ class _DummySession:
         return SimpleNamespace(code=0)
 
 
-def _make_svc():
-    return BiSyncService(_DummySession())
+def _make_svc(**kwargs):
+    return BiSyncService(_DummySession(), **kwargs)
 
 
 def _make_job(**overrides):
@@ -231,6 +237,7 @@ class TestComputeDeletes:
         plan = svc.compute_bi_changes(_make_job(), {}, remote)
         assert plan["delete_remote"] == []
         assert plan["pull_downloads"] == []
+        assert plan["keep_remote"] == ["a.txt"]
 
     def test_local_deleted_remote_changed_restores(self, tmp_db):
         """本地删了文件，但云端又改了 → 拉回本地（不删除云端）。"""
@@ -258,6 +265,60 @@ class TestComputeDeletes:
         local = {"a.txt": _local_file()}
         plan = svc.compute_bi_changes(_make_job(), local, {})
         assert plan["delete_local"] == []
+        assert plan["keep_local"] == ["a.txt"]
+
+    def test_disabled_delete_directions_are_reported_as_skipped(
+        self, tmp_db, tmp_path
+    ):
+        root = tmp_path / "local"
+        root.mkdir()
+        local_file = root / "cloud-deleted.txt"
+        local_file.write_bytes(b"local")
+        local_stat = local_file.stat()
+
+        svc = _make_svc()
+        svc._store.set_state(
+            1,
+            "cloud-deleted.txt",
+            local_stat.st_size,
+            int(local_stat.st_mtime),
+            local_stat.st_size,
+            200,
+        )
+        svc._store.set_state(1, "local-deleted.txt", 10, 100, 10, 300)
+        svc.build_remote_index = MagicMock(
+            return_value={
+                "local-deleted.txt": {
+                    "FileId": 2,
+                    "FileName": "local-deleted.txt",
+                    "Type": 0,
+                    "Size": 10,
+                    "UpdateAt": 300,
+                }
+            }
+        )
+        events = []
+
+        success, stats = svc.run_bi_sync(
+            _make_job(local_path=str(root)), event_callback=events.append
+        )
+
+        assert success is True
+        assert stats["skipped"] == 2
+        plan = next(
+            event for event in events
+            if event.event_type == BiSyncEventType.PLAN_READY
+        )
+        assert {item.action for item in plan.items} == {
+            BiSyncAction.KEEP_LOCAL,
+            BiSyncAction.KEEP_REMOTE,
+        }
+        blocked = [
+            event for event in events
+            if event.event_type == BiSyncEventType.ITEM_FINISHED
+            and event.status == BiSyncItemStatus.BLOCKED
+        ]
+        assert len(blocked) == 2
 
     def test_remote_deleted_local_changed_repush(self, tmp_db):
         """云端删了文件，但本地又改了 → 重新上传（不删除本地）。"""
@@ -426,7 +487,7 @@ class TestRunBiSync:
         svc.build_remote_index = MagicMock(
             return_value={"a.txt": _remote_file(size=5, updateat=1_700_000_000)}
         )
-        svc._download.link_by_fileDetail = MagicMock(return_value="http://x/a")
+        svc._download.require_download_link = MagicMock(return_value="http://x/a")
         svc._download.download_file = MagicMock(return_value=True)
         job = _make_job(local_path=str(root))
         success, stats = svc.run_bi_sync(job)
@@ -443,7 +504,9 @@ class TestRunBiSync:
         svc.build_remote_index = MagicMock(
             return_value={"a.txt": _remote_file()}
         )
-        svc._download.link_by_fileDetail = MagicMock(return_value=5113)
+        svc._download.require_download_link = MagicMock(
+            side_effect=DownloadLinkError(5113, "download unavailable")
+        )
         job = _make_job(local_path=str(root))
         success, stats = svc.run_bi_sync(job)
         assert success is True  # 单文件失败不中止整个同步
@@ -468,7 +531,7 @@ class TestRunBiSync:
                 1, True, 1,
             )
         )
-        svc._download.link_by_fileDetail = MagicMock(return_value="http://x/a")
+        svc._download.require_download_link = MagicMock(return_value="http://x/a")
 
         def _fake_download(url, target, size, **kwargs):
             target.write_bytes(b"x" * min(size, 64))
@@ -495,7 +558,13 @@ class TestRunBiSync:
         root = self._prepare_local(tmp_path)
         (root / "a.txt").write_bytes(b"x")
         (root / "b.txt").write_bytes(b"y")
-        svc = _make_svc()
+        trashed = []
+
+        def _trash(path):
+            trashed.append(path)
+            path.unlink()
+
+        svc = _make_svc(local_trash=_trash)
         # 快照 mtime 必须与磁盘真实值一致（否则会被误判为本地修改）
         st_a = (root / "a.txt").stat()
         svc._store.set_state(1, "a.txt", st_a.st_size, int(st_a.st_mtime), 1, 200)
@@ -519,5 +588,208 @@ class TestRunBiSync:
         assert stats["deleted_remote"] == 1
         assert stats["deleted_local"] == 1
         svc._session.trash_file.assert_called_once()
+        assert trashed == [root / "a.txt"]
         assert not (root / "a.txt").exists()
         assert _get_state(svc) == {}
+
+
+class TestRunEventsAndSafety:
+    def test_plan_precedes_serial_file_events_and_reports_bytes(
+        self, tmp_db, tmp_path
+    ):
+        root = tmp_path / "local"
+        root.mkdir()
+        remote_a = _remote_file(fid=1, size=10, updateat=100)
+        remote_b = _remote_file(fid=2, size=20, updateat=200)
+        remote_b["FileName"] = "b.txt"
+        svc = _make_svc()
+        svc.build_remote_index = MagicMock(
+            return_value={"a.txt": remote_a, "b.txt": remote_b}
+        )
+        svc._download.require_download_link = MagicMock(
+            side_effect=["http://x/a", "http://x/b"]
+        )
+
+        def _download(_url, target, size, progress_callback=None, **_kwargs):
+            if progress_callback:
+                progress_callback(size // 2, size)
+            target.write_bytes(b"x" * size)
+            return True
+
+        svc._download.download_file = MagicMock(side_effect=_download)
+        events = []
+        success, stats = svc.run_bi_sync(
+            _make_job(local_path=str(root)), event_callback=events.append
+        )
+
+        assert success is True
+        assert stats["downloaded"] == 2
+        event_types = [event.event_type for event in events]
+        assert event_types.index(BiSyncEventType.PLAN_READY) < event_types.index(
+            BiSyncEventType.ITEM_STARTED
+        )
+        plan = next(
+            event for event in events
+            if event.event_type == BiSyncEventType.PLAN_READY
+        )
+        assert [item.action for item in plan.items] == [
+            BiSyncAction.DOWNLOAD,
+            BiSyncAction.DOWNLOAD,
+        ]
+        first_id, second_id = [item.item_id for item in plan.items]
+        ordered = [(event.event_type, event.item_id) for event in events]
+        assert ordered.index((BiSyncEventType.ITEM_FINISHED, first_id)) < ordered.index(
+            (BiSyncEventType.ITEM_STARTED, second_id)
+        )
+        first_progress = [
+            event.transferred for event in events
+            if event.event_type == BiSyncEventType.ITEM_PROGRESS
+            and event.item_id == first_id
+        ]
+        assert first_progress == sorted(first_progress)
+        assert first_progress[-1] == plan.items[0].size
+
+    def test_24010_retries_then_downloads(self, tmp_db, tmp_path):
+        root = tmp_path / "local"
+        root.mkdir()
+        svc = _make_svc(link_retry_delays=(0, 0))
+        svc.build_remote_index = MagicMock(
+            return_value={"a.txt": _remote_file(size=5)}
+        )
+        svc._download.require_download_link = MagicMock(
+            side_effect=[
+                DownloadLinkError(24010, "专业空间不足"),
+                DownloadLinkError(24010, "专业空间不足"),
+                "http://x/a",
+            ]
+        )
+
+        def _download(_url, target, size, **_kwargs):
+            target.write_bytes(b"x" * size)
+            return True
+
+        svc._download.download_file = MagicMock(side_effect=_download)
+        success, stats = svc.run_bi_sync(_make_job(local_path=str(root)))
+
+        assert success is True
+        assert stats["downloaded"] == 1
+        assert svc._download.require_download_link.call_count == 3
+
+    def test_cancel_during_24010_backoff_stops_before_retry(
+        self, tmp_db, tmp_path
+    ):
+        class _CancelOnRetry:
+            def __init__(self):
+                self.checks = 0
+
+            @property
+            def is_cancelled(self):
+                self.checks += 1
+                return self.checks >= 3
+
+        root = tmp_path / "local"
+        root.mkdir()
+        svc = _make_svc(link_retry_delays=(5,))
+        svc.build_remote_index = MagicMock(
+            return_value={"a.txt": _remote_file(size=5)}
+        )
+        svc._download.require_download_link = MagicMock(
+            side_effect=DownloadLinkError(24010, "专业空间不足")
+        )
+        svc._download.download_file = MagicMock()
+
+        success, stats = svc.run_bi_sync(
+            _make_job(local_path=str(root)), cancel=_CancelOnRetry()
+        )
+
+        assert success is False
+        assert stats["downloaded"] == 0
+        assert svc._download.require_download_link.call_count == 1
+        svc._download.download_file.assert_not_called()
+
+    def test_persistent_24010_blocks_remaining_downloads_and_deletes(
+        self, tmp_db, tmp_path
+    ):
+        root = tmp_path / "local"
+        root.mkdir()
+        local_delete = root / "local-delete.txt"
+        local_delete.write_bytes(b"local")
+        local_stat = local_delete.stat()
+        trash = MagicMock()
+        svc = _make_svc(local_trash=trash, link_retry_delays=(0, 0))
+        svc._store.set_state(
+            1, "local-delete.txt", local_stat.st_size,
+            int(local_stat.st_mtime), 5, 200,
+        )
+        svc._store.set_state(1, "remote-delete.txt", 7, 100, 7, 200)
+
+        download_a = _remote_file(fid=1, size=10, updateat=300)
+        download_b = _remote_file(fid=2, size=20, updateat=400)
+        download_b["FileName"] = "b.txt"
+        remote_delete = _remote_file(fid=3, size=7, updateat=200)
+        remote_delete["FileName"] = "remote-delete.txt"
+        svc.build_remote_index = MagicMock(return_value={
+            "a.txt": download_a,
+            "b.txt": download_b,
+            "remote-delete.txt": remote_delete,
+        })
+        svc._download.require_download_link = MagicMock(
+            side_effect=DownloadLinkError(24010, "专业空间不足")
+        )
+        svc._download.download_file = MagicMock()
+        svc._session.trash_file = MagicMock()
+        events = []
+        job = _make_job(
+            local_path=str(root), delete_remote=True, delete_local=True
+        )
+        success, stats = svc.run_bi_sync(job, event_callback=events.append)
+
+        assert success is False
+        assert stats["failed"] == 1
+        assert stats["skipped"] == 3
+        assert svc._download.require_download_link.call_count == 3
+        svc._download.download_file.assert_not_called()
+        svc._session.trash_file.assert_not_called()
+        trash.assert_not_called()
+        assert local_delete.exists()
+        assert set(_get_state(svc)) == {"local-delete.txt", "remote-delete.txt"}
+        final_statuses = {
+            event.item_id: event.status
+            for event in events
+            if event.event_type == BiSyncEventType.ITEM_FINISHED
+        }
+        assert list(final_statuses.values()).count(BiSyncItemStatus.FAILED) == 1
+        assert list(final_statuses.values()).count(BiSyncItemStatus.BLOCKED) == 3
+
+    def test_trash_failure_keeps_file_and_snapshot(self, tmp_db, tmp_path):
+        root = tmp_path / "local"
+        root.mkdir()
+        target = root / "a.txt"
+        target.write_bytes(b"hello")
+        stat = target.stat()
+
+        def _trash_failure(_path):
+            raise OSError("recycle bin unavailable")
+
+        svc = _make_svc(local_trash=_trash_failure)
+        svc._store.set_state(
+            1, "a.txt", stat.st_size, int(stat.st_mtime), 5, 200
+        )
+        svc.build_remote_index = MagicMock(return_value={})
+        events = []
+        success, stats = svc.run_bi_sync(
+            _make_job(local_path=str(root), delete_local=True),
+            event_callback=events.append,
+        )
+
+        assert success is True
+        assert stats["failed"] == 1
+        assert stats["deleted_local"] == 0
+        assert target.exists()
+        assert "a.txt" in _get_state(svc)
+        failed = [
+            event for event in events
+            if event.event_type == BiSyncEventType.ITEM_FINISHED
+        ]
+        assert failed[-1].status == BiSyncItemStatus.FAILED
+        assert "recycle bin unavailable" in failed[-1].message

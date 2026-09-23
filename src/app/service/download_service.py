@@ -18,6 +18,16 @@ from ..common.speed_limiter import SpeedLimiter
 logger = get_logger(__name__)
 
 
+class DownloadLinkError(RuntimeError):
+    """获取下载链接时服务端返回的结构化错误。"""
+
+    def __init__(self, code, message):
+        self.code = int(code)
+        self.message = str(message or "")
+        detail = self.message or "未知错误"
+        super().__init__(f"获取下载链接失败 (code={self.code}): {detail}")
+
+
 class DownloadService:
     """下载服务。
 
@@ -34,11 +44,21 @@ class DownloadService:
             str: 下载URL（成功）
             int: 错误码（失败）
         """
+        try:
+            return self.require_download_link(file_detail, showlink=showlink)
+        except DownloadLinkError as error:
+            return error.code
+
+    def require_download_link(self, file_detail, showlink=True):
+        """获取下载链接，失败时保留服务端错误码和消息。"""
         result = self._session.get_file_link(file_detail)
         if result.code != 0:
-            logger.error("获取下载链接失败，返回码: %s", result.code)
-            logger.error(result.msg)
-            return result.code
+            logger.error(
+                "获取下载链接失败: code=%s, message=%s",
+                result.code,
+                result.msg,
+            )
+            raise DownloadLinkError(result.code, result.msg)
         redirect_url = result.data
         if showlink:
             logger.info("获取下载链接成功: %s", redirect_url)

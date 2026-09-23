@@ -13,6 +13,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from ..common.bi_sync_events import (
+    BiSyncAction,
+    BiSyncEventType,
+    BiSyncItemStatus,
+    BiSyncPlanItem,
+    BiSyncServiceEvent,
+)
 from ..common.bi_sync_store import (
     CONFLICT_KEEP_BOTH,
     CONFLICT_LOCAL_WINS,
@@ -21,7 +28,7 @@ from ..common.bi_sync_store import (
     BiSyncStore,
 )
 from ..common.log import get_logger
-from .download_service import DownloadService
+from .download_service import DownloadLinkError, DownloadService
 from .sync_service import (
     PHASE_DELETE,
     PHASE_SCAN_LOCAL,
@@ -62,10 +69,15 @@ class BiSyncService(SyncService):
     不持有 Qt 依赖，可由后台线程调用。
     """
 
-    def __init__(self, session, account_name=None):
+    def __init__(self, session, account_name=None, local_trash=None,
+                 link_retry_delays=None):
         super().__init__(session, account_name)
         self._download = DownloadService(session)
         self._store = BiSyncStore()
+        self._local_trash = local_trash
+        self._link_retry_delays = tuple(
+            (5, 15) if link_retry_delays is None else link_retry_delays
+        )
 
     # ---- 工具 ----
 
@@ -132,6 +144,8 @@ class BiSyncService(SyncService):
             - conflicts: [(rel_path, remote_item)] 冲突（保留双方副本：主路径上传本地版，云端版另存副本）
             - delete_remote: [rel_path] 删除云端条目
             - delete_local: [rel_path] 删除本地条目
+            - keep_remote: [rel_path] 本地已删除但删除云端未启用
+            - keep_local: [rel_path] 云端已删除但移入本地回收站未启用
             - type_conflicts: [rel_path] 文件/目录同名冲突（跳过并计失败）
         """
         job_id = int(job["id"])
@@ -150,6 +164,8 @@ class BiSyncService(SyncService):
             "conflicts": [],
             "delete_remote": [],
             "delete_local": [],
+            "keep_remote": [],
+            "keep_local": [],
             "type_conflicts": [],
         }
 
@@ -247,7 +263,9 @@ class BiSyncService(SyncService):
                     plan["push_uploads"].append(
                         (rel, local["abs"], parent_rel, True)
                     )
-                # else: delete_local 关闭且云端副本确认过 → 保持不动（尊重云端删除）
+                else:
+                    # 检测到云端删除，但当前任务未启用本地删除传播。
+                    plan["keep_local"].append(rel)
                 continue
 
             # remote_is_file（本地缺失）
@@ -256,13 +274,155 @@ class BiSyncService(SyncService):
             elif delete_remote:
                 # 云端未变而本地被删除 → 删除云端
                 plan["delete_remote"].append(rel)
+            else:
+                # 检测到本地删除，但当前任务未启用云端删除传播。
+                plan["keep_remote"].append(rel)
 
         return plan
+
+    # ---- 运行事件 ----
+
+    @staticmethod
+    def _emit_event(callback, event):
+        """运行事件不得反向影响同步结果。"""
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception:
+            logger.exception("双向同步运行事件回调异常")
+
+    @staticmethod
+    def _item_id(action, rel):
+        return f"{action.value}:{rel}"
+
+    def _build_plan_items(self, plan, local_index, remote_index):
+        """按实际执行顺序把内部计划转换为可展示计划项。"""
+        items = []
+
+        def _append(action, rel, is_dir=False, size=0, modified_at=0):
+            items.append(
+                BiSyncPlanItem(
+                    item_id=self._item_id(action, rel),
+                    action=action,
+                    relative_path=rel,
+                    name=rel.rsplit("/", 1)[-1],
+                    is_dir=is_dir,
+                    size=max(0, int(size or 0)),
+                    modified_at=max(0, int(modified_at or 0)),
+                )
+            )
+
+        for rel, _ in sorted(plan["push_dirs"], key=lambda x: x[0].count("/")):
+            local = local_index.get(rel) or {}
+            _append(
+                BiSyncAction.CREATE_REMOTE_DIR, rel, True,
+                local.get("size", 0), local.get("mtime", 0),
+            )
+        for rel, _, _, _ in plan["push_uploads"]:
+            local = local_index.get(rel) or {}
+            _append(
+                BiSyncAction.UPLOAD, rel, False,
+                local.get("size", 0), local.get("mtime", 0),
+            )
+        for rel in sorted(plan["pull_dirs"], key=lambda value: value.count("/")):
+            remote = remote_index.get(rel) or {}
+            _append(
+                BiSyncAction.CREATE_LOCAL_DIR, rel, True,
+                self._remote_size(remote), self._remote_updateat(remote),
+            )
+        for rel, remote in plan["pull_downloads"]:
+            _append(
+                BiSyncAction.DOWNLOAD, rel, False,
+                self._remote_size(remote), self._remote_updateat(remote),
+            )
+        for rel, remote in plan["conflicts"]:
+            _append(
+                BiSyncAction.CONFLICT_COPY, rel, False,
+                self._remote_size(remote), self._remote_updateat(remote),
+            )
+
+        remote_files = [
+            rel for rel in plan["delete_remote"]
+            if int(remote_index[rel].get("Type", 0)) == 0
+        ]
+        remote_dirs = sorted(
+            (
+                rel for rel in plan["delete_remote"]
+                if int(remote_index[rel].get("Type", 0)) == 1
+            ),
+            key=lambda value: -value.count("/"),
+        )
+        for rel in remote_files + remote_dirs:
+            remote = remote_index.get(rel) or {}
+            _append(
+                BiSyncAction.DELETE_REMOTE, rel,
+                int(remote.get("Type", 0)) == 1,
+                self._remote_size(remote), self._remote_updateat(remote),
+            )
+
+        local_files = [
+            rel for rel in plan["delete_local"]
+            if not local_index[rel]["is_dir"]
+        ]
+        local_dirs = sorted(
+            (rel for rel in plan["delete_local"] if local_index[rel]["is_dir"]),
+            key=lambda value: -value.count("/"),
+        )
+        for rel in local_files:
+            local = local_index.get(rel) or {}
+            _append(
+                BiSyncAction.TRASH_LOCAL, rel, False,
+                local.get("size", 0), local.get("mtime", 0),
+            )
+        for rel in local_dirs:
+            local = local_index.get(rel) or {}
+            _append(
+                BiSyncAction.REMOVE_LOCAL_DIR, rel, True,
+                local.get("size", 0), local.get("mtime", 0),
+            )
+
+        for rel in plan.get("keep_local", ()):
+            local = local_index.get(rel) or {}
+            _append(
+                BiSyncAction.KEEP_LOCAL, rel, bool(local.get("is_dir")),
+                local.get("size", 0), local.get("mtime", 0),
+            )
+        for rel in plan.get("keep_remote", ()):
+            remote = remote_index.get(rel) or {}
+            _append(
+                BiSyncAction.KEEP_REMOTE, rel,
+                int(remote.get("Type", 0)) == 1,
+                self._remote_size(remote), self._remote_updateat(remote),
+            )
+
+        for rel in plan["type_conflicts"]:
+            local = local_index.get(rel) or {}
+            remote = remote_index.get(rel) or {}
+            is_dir = bool(local.get("is_dir")) or int(remote.get("Type", 0)) == 1
+            _append(
+                BiSyncAction.TYPE_CONFLICT, rel, is_dir,
+                local.get("size", self._remote_size(remote)),
+                local.get("mtime", self._remote_updateat(remote)),
+            )
+        return tuple(items)
+
+    @staticmethod
+    def _wait_with_cancel(seconds, cancel):
+        """可取消的短间隔等待；返回 False 表示用户已取消。"""
+        deadline = time.monotonic() + max(0, seconds)
+        while time.monotonic() < deadline:
+            if cancel is not None and getattr(cancel, "is_cancelled", False):
+                return False
+            time.sleep(min(0.1, deadline - time.monotonic()))
+        return not (
+            cancel is not None and getattr(cancel, "is_cancelled", False)
+        )
 
     # ---- 执行 ----
 
     def run_bi_sync(self, job, progress_callback=None, cancel=None,
-                    refresh_session=None):
+                    refresh_session=None, event_callback=None):
         """执行一次完整双向同步。
 
         Args:
@@ -272,6 +432,7 @@ class BiSyncService(SyncService):
             cancel: 可选对象，具备 is_cancelled 属性
             refresh_session: 可选回调，token 过期时重新登录并返回 200 表示成功
                 （由调用方传入，通常为 Pan123.login）
+            event_callback: 可选 BiSyncServiceEvent 回调，用于展示运行详情
 
         Returns:
             (success, stats)，stats = {"added","updated","downloaded",
@@ -286,6 +447,46 @@ class BiSyncService(SyncService):
             "skipped": 0,
         }
 
+        def _emit(event_type, **kwargs):
+            self._emit_event(
+                event_callback,
+                BiSyncServiceEvent(event_type=event_type, **kwargs),
+            )
+
+        def _phase(phase):
+            _emit(BiSyncEventType.PHASE_CHANGED, phase=phase)
+
+        def _start_item(action, rel, total=0, message=""):
+            _emit(
+                BiSyncEventType.ITEM_STARTED,
+                item_id=self._item_id(action, rel),
+                total=max(0, int(total or 0)),
+                status=BiSyncItemStatus.RUNNING,
+                message=message,
+            )
+
+        def _progress_item(action, rel, transferred, total, message=""):
+            _emit(
+                BiSyncEventType.ITEM_PROGRESS,
+                item_id=self._item_id(action, rel),
+                transferred=max(0, int(transferred or 0)),
+                total=max(0, int(total or 0)),
+                status=BiSyncItemStatus.RUNNING,
+                message=message,
+            )
+
+        def _finish_item(action, rel, status, message=""):
+            _emit(
+                BiSyncEventType.ITEM_FINISHED,
+                item_id=self._item_id(action, rel),
+                status=status,
+                message=message,
+            )
+
+        def _block_item(action, rel, message):
+            stats["skipped"] += 1
+            _finish_item(action, rel, BiSyncItemStatus.BLOCKED, message)
+
         def _cancelled():
             return cancel is not None and getattr(cancel, "is_cancelled", False)
 
@@ -298,11 +499,13 @@ class BiSyncService(SyncService):
             return False, stats
 
         # 1. 本地索引
+        _phase(PHASE_SCAN_LOCAL)
         if progress_callback:
             progress_callback(None, 0, 0, PHASE_SCAN_LOCAL)
         local_index = self.build_local_index(local_root)
 
         # 2. 云端索引（失败必须中止，防止误传/误删）
+        _phase(PHASE_SCAN_REMOTE)
         if progress_callback:
             progress_callback(None, 0, 0, PHASE_SCAN_REMOTE)
         remote_index = self.build_remote_index(remote_root)
@@ -312,15 +515,19 @@ class BiSyncService(SyncService):
 
         # 3. 变更计划
         plan = self.compute_bi_changes(job, local_index, remote_index)
+        plan_items = self._build_plan_items(plan, local_index, remote_index)
+        _emit(BiSyncEventType.PLAN_READY, items=plan_items)
         logger.info(
             "双向同步计划: job=%s, 上传=%d, 建目录=%d, 下载=%d, 冲突=%d, "
-            "删云端=%d, 删本地=%d",
+            "删云端=%d, 删本地=%d, 保留=%d",
             job.get("name"), len(plan["push_uploads"]), len(plan["push_dirs"]),
             len(plan["pull_downloads"]), len(plan["conflicts"]),
             len(plan["delete_remote"]), len(plan["delete_local"]),
+            len(plan.get("keep_remote", ())) + len(plan.get("keep_local", ())),
         )
 
         # 4. 创建缺失的云端目录（顶层优先）
+        _phase(PHASE_UPLOAD)
         dir_id_map = {
             rel: item["FileId"]
             for rel, item in remote_index.items()
@@ -330,21 +537,30 @@ class BiSyncService(SyncService):
         for rel, parent_rel in sorted(
             plan["push_dirs"], key=lambda x: x[0].count("/")
         ):
+            action = BiSyncAction.CREATE_REMOTE_DIR
+            _start_item(action, rel, 1)
             if _cancelled():
+                _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                 return False, stats
             parent_id = dir_id_map.get(parent_rel)
             if parent_id is None:
+                error = "父目录缺失"
                 logger.error("双向同步建目录失败，父目录缺失: %s", rel)
                 stats["failed"] += 1
+                _finish_item(action, rel, BiSyncItemStatus.FAILED, error)
                 continue
             name = rel.rsplit("/", 1)[-1]
             fid, err = self._file.create_folder(name, parent_id)
             if fid is None:
+                error = str(err or "创建云端目录失败")
                 logger.error("双向同步建目录失败: %s (%s)", rel, err)
                 stats["failed"] += 1
+                _finish_item(action, rel, BiSyncItemStatus.FAILED, error)
                 continue
             dir_id_map[rel] = fid
             remote_index.setdefault(rel, {"FileId": fid, "Type": 1})
+            _progress_item(action, rel, 1, 1)
+            _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
             logger.debug("双向同步已创建云端目录: %s", rel)
 
         # 5. 上传本地变化
@@ -352,24 +568,41 @@ class BiSyncService(SyncService):
         for i, (rel, abs_path, parent_rel, is_new) in enumerate(
             plan["push_uploads"], start=1
         ):
+            action = BiSyncAction.UPLOAD
+            file_size = int((local_index.get(rel) or {}).get("size", 0) or 0)
+            _start_item(action, rel, file_size)
             if _cancelled():
+                _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                 return False, stats
             parent_id = dir_id_map.get(parent_rel)
             if parent_id is None:
+                error = "父目录缺失"
                 logger.error("双向同步上传失败，父目录缺失: %s", rel)
                 stats["failed"] += 1
+                _finish_item(action, rel, BiSyncItemStatus.FAILED, error)
                 continue
             if progress_callback:
                 progress_callback(rel, i, total, PHASE_UPLOAD)
+
+            def _upload_progress(uploaded, item_rel=rel, item_size=file_size):
+                _progress_item(
+                    BiSyncAction.UPLOAD,
+                    item_rel,
+                    min(max(0, int(uploaded or 0)), item_size),
+                    item_size,
+                )
+
             try:
                 # 统一覆盖语义（dup_choice=2）：重复上传时服务端按 MD5 复用，
                 # 避免“新文件但服务端已有同名文件”时 5060 竞态；
                 # 传入 refresh_session：token 过期时自动重登重试（与 UI 上传一致）
                 result = self._upload.up_load(
                     abs_path, parent_id, dup_choice=2, task=cancel,
+                    progress_callback=_upload_progress,
                     refresh_session=refresh_session,
                 )
                 if result == "已取消":
+                    _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                     return False, stats
                 # 验证服务端确实注册了文件（服务端偶发静默丢弃时保护本地数据，
                 # 避免下次同步被误判为“云端已删除”而删本地）
@@ -378,8 +611,10 @@ class BiSyncService(SyncService):
                     parent_id, name, refresh_session
                 )
                 if remote_item is None:
+                    error = "上传后未在云端确认文件"
                     logger.error("双向同步上传未在云端确认: %s", rel)
                     stats["failed"] += 1
+                    _finish_item(action, rel, BiSyncItemStatus.FAILED, error)
                     continue
                 if is_new:
                     stats["added"] += 1
@@ -392,62 +627,176 @@ class BiSyncService(SyncService):
                     self._remote_size(remote_item),
                     self._remote_updateat(remote_item),
                 )
+                _progress_item(action, rel, file_size, file_size)
+                _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
             except Exception as e:
                 logger.error("双向同步上传失败: %s (%s)", rel, e)
                 stats["failed"] += 1
+                _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
 
         # 6. 创建缺失的本地目录
         for rel in sorted(plan["pull_dirs"], key=lambda r: r.count("/")):
+            action = BiSyncAction.CREATE_LOCAL_DIR
+            _start_item(action, rel, 1)
             if _cancelled():
+                _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                 return False, stats
             target = Path(local_root) / rel.replace("/", os.sep)
             try:
                 target.mkdir(parents=True, exist_ok=True)
+                _progress_item(action, rel, 1, 1)
+                _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
             except OSError as e:
                 logger.error("双向同步建本地目录失败: %s (%s)", rel, e)
                 stats["failed"] += 1
+                _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
 
         # 7. 下载云端变化
+        _phase(PHASE_PULL)
+        download_blocked = False
+        download_block_message = ""
         total = len(plan["pull_downloads"])
         for i, (rel, item) in enumerate(plan["pull_downloads"], start=1):
+            action = BiSyncAction.DOWNLOAD
+            file_size = self._remote_size(item)
+            _start_item(action, rel, file_size)
             if _cancelled():
+                _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                 return False, stats
             if progress_callback:
                 progress_callback(rel, i, total, PHASE_PULL)
+
+            def _download_progress(done, total_bytes, item_rel=rel):
+                _progress_item(
+                    BiSyncAction.DOWNLOAD, item_rel, done, total_bytes
+                )
+
+            def _download_retry(error, delay, attempt, item_rel=rel):
+                message = f"{error}；{delay} 秒后第 {attempt} 次重试"
+                _progress_item(
+                    BiSyncAction.DOWNLOAD, item_rel, 0, file_size, message
+                )
+
             try:
-                if not self._download_one(item, local_root, rel, cancel):
-                    return False, stats  # 已取消
+                if not self._download_one(
+                    item, local_root, rel, cancel,
+                    progress_callback=_download_progress,
+                    retry_callback=_download_retry,
+                ):
+                    _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
+                    return False, stats
                 size = self._remote_size(item)
                 updateat = self._remote_updateat(item)
                 self._store.set_state(
                     job_id, rel, size, updateat, size, updateat
                 )
                 stats["downloaded"] += 1
+                _progress_item(action, rel, size, size)
+                _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
+            except DownloadLinkError as e:
+                logger.error("双向同步下载失败: %s (%s)", rel, e)
+                stats["failed"] += 1
+                _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
+                if e.code == 24010:
+                    download_blocked = True
+                    download_block_message = str(e)
+                    for blocked_rel, _ in plan["pull_downloads"][i:]:
+                        _block_item(
+                            BiSyncAction.DOWNLOAD,
+                            blocked_rel,
+                            download_block_message,
+                        )
+                    break
             except Exception as e:
                 logger.error("双向同步下载失败: %s (%s)", rel, e)
                 stats["failed"] += 1
+                _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
 
         # 8. 冲突保留双方副本：云端版本另存本地副本（主路径保留本地版本，
         #    副本作为新文件在下次同步时上传，两侧最终都保有双方内容）
-        for rel, item in plan["conflicts"]:
-            if _cancelled():
-                return False, stats
-            copy_rel, _ = self._conflict_copy_path(local_root, rel, item)
-            if progress_callback:
-                progress_callback(copy_rel, 0, 0, PHASE_PULL)
-            try:
-                if not self._download_one(item, local_root, copy_rel, cancel):
-                    return False, stats  # 已取消
-                # 副本不写快照：作为全新本地文件，下次同步自动上传到云端
-                stats["downloaded"] += 1
-                stats["conflicts"] += 1
-                logger.info("双向同步冲突保留双方副本: %s → %s", rel, copy_rel)
-            except Exception as e:
-                logger.error("双向同步冲突副本下载失败: %s (%s)", rel, e)
-                stats["failed"] += 1
+        if download_blocked:
+            for rel, _ in plan["conflicts"]:
+                _block_item(
+                    BiSyncAction.CONFLICT_COPY, rel, download_block_message
+                )
+        else:
+            for conflict_index, (rel, item) in enumerate(plan["conflicts"]):
+                action = BiSyncAction.CONFLICT_COPY
+                file_size = self._remote_size(item)
+                _start_item(action, rel, file_size)
+                if _cancelled():
+                    _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
+                    return False, stats
+                copy_rel, _ = self._conflict_copy_path(local_root, rel, item)
+                if progress_callback:
+                    progress_callback(copy_rel, 0, 0, PHASE_PULL)
+
+                def _conflict_progress(done, total_bytes, item_rel=rel):
+                    _progress_item(
+                        BiSyncAction.CONFLICT_COPY,
+                        item_rel,
+                        done,
+                        total_bytes,
+                    )
+
+                def _conflict_retry(error, delay, attempt, item_rel=rel):
+                    message = f"{error}；{delay} 秒后第 {attempt} 次重试"
+                    _progress_item(
+                        BiSyncAction.CONFLICT_COPY,
+                        item_rel,
+                        0,
+                        file_size,
+                        message,
+                    )
+
+                try:
+                    if not self._download_one(
+                        item, local_root, copy_rel, cancel,
+                        progress_callback=_conflict_progress,
+                        retry_callback=_conflict_retry,
+                    ):
+                        _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
+                        return False, stats
+                    # 副本不写快照：作为全新本地文件，下次同步自动上传到云端
+                    stats["downloaded"] += 1
+                    stats["conflicts"] += 1
+                    _progress_item(action, rel, file_size, file_size)
+                    _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
+                    logger.info("双向同步冲突保留双方副本: %s → %s", rel, copy_rel)
+                except DownloadLinkError as e:
+                    logger.error("双向同步冲突副本下载失败: %s (%s)", rel, e)
+                    stats["failed"] += 1
+                    _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
+                    if e.code == 24010:
+                        download_blocked = True
+                        download_block_message = str(e)
+                        for blocked_rel, _ in plan["conflicts"][conflict_index + 1:]:
+                            _block_item(
+                                BiSyncAction.CONFLICT_COPY,
+                                blocked_rel,
+                                download_block_message,
+                            )
+                        break
+                except Exception as e:
+                    logger.error("双向同步冲突副本下载失败: %s (%s)", rel, e)
+                    stats["failed"] += 1
+                    _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
 
         # 9. 删除云端多余条目（delete_remote），文件优先、目录自底向上
-        if plan["delete_remote"]:
+        _phase(PHASE_DELETE)
+        if download_blocked:
+            for rel in plan["delete_remote"]:
+                _block_item(
+                    BiSyncAction.DELETE_REMOTE, rel, download_block_message
+                )
+            for rel in plan["delete_local"]:
+                action = (
+                    BiSyncAction.REMOVE_LOCAL_DIR
+                    if local_index[rel]["is_dir"]
+                    else BiSyncAction.TRASH_LOCAL
+                )
+                _block_item(action, rel, download_block_message)
+        elif plan["delete_remote"]:
             file_dels = [
                 r for r in plan["delete_remote"]
                 if int(remote_index[r].get("Type", 0)) == 0
@@ -460,7 +809,10 @@ class BiSyncService(SyncService):
                 key=lambda x: -x.count("/"),
             )
             for rel in file_dels + dir_dels:
+                action = BiSyncAction.DELETE_REMOTE
+                _start_item(action, rel, 1)
                 if _cancelled():
+                    _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                     return False, stats
                 if progress_callback:
                     progress_callback(rel, 0, 0, PHASE_DELETE)
@@ -471,18 +823,23 @@ class BiSyncService(SyncService):
                     if result.code == 0:
                         stats["deleted_remote"] += 1
                         self._store.remove_state(job_id, rel)
+                        _progress_item(action, rel, 1, 1)
+                        _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
                     else:
+                        error = f"服务端返回 code={result.code}"
                         logger.warning(
                             "双向同步删除云端失败: %s (code=%s)",
                             rel, result.code,
                         )
                         stats["failed"] += 1
+                        _finish_item(action, rel, BiSyncItemStatus.FAILED, error)
                 except Exception as e:
                     logger.error("双向同步删除云端异常: %s (%s)", rel, e)
                     stats["failed"] += 1
+                    _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
 
-        # 10. 删除本地多余条目（delete_local），文件优先、目录自底向上仅删空目录
-        if plan["delete_local"]:
+        # 10. 本地文件移入系统回收站；空目录仍用 rmdir 保留非空安全闸
+        if not download_blocked and plan["delete_local"]:
             file_dels = [
                 r for r in plan["delete_local"]
                 if not local_index[r]["is_dir"]
@@ -492,21 +849,32 @@ class BiSyncService(SyncService):
                 key=lambda x: -x.count("/"),
             )
             for rel in file_dels:
+                action = BiSyncAction.TRASH_LOCAL
+                _start_item(action, rel, 1)
                 if _cancelled():
+                    _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                     return False, stats
                 if progress_callback:
                     progress_callback(rel, 0, 0, PHASE_DELETE)
                 path = Path(local_root) / rel.replace("/", os.sep)
                 try:
-                    if path.exists() and path.is_file():
-                        os.remove(path)
+                    if path.exists() or path.is_symlink():
+                        if self._local_trash is None:
+                            raise RuntimeError("未配置系统回收站适配器")
+                        self._local_trash(path)
                     stats["deleted_local"] += 1
                     self._store.remove_state(job_id, rel)
-                except OSError as e:
-                    logger.error("双向同步删除本地文件失败: %s (%s)", rel, e)
+                    _progress_item(action, rel, 1, 1)
+                    _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
+                except Exception as e:
+                    logger.error("双向同步移入本地回收站失败: %s (%s)", rel, e)
                     stats["failed"] += 1
+                    _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
             for rel in dir_dels:
+                action = BiSyncAction.REMOVE_LOCAL_DIR
+                _start_item(action, rel, 1)
                 if _cancelled():
+                    _finish_item(action, rel, BiSyncItemStatus.CANCELLED)
                     return False, stats
                 if progress_callback:
                     progress_callback(rel, 0, 0, PHASE_DELETE)
@@ -516,28 +884,46 @@ class BiSyncService(SyncService):
                         os.rmdir(path)  # 仅删空目录，防止误删未知内容
                     stats["deleted_local"] += 1
                     self._store.remove_state(job_id, rel)
+                    _progress_item(action, rel, 1, 1)
+                    _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
                 except OSError as e:
                     logger.warning(
                         "双向同步删除本地目录失败(仅删空目录): %s (%s)", rel, e
                     )
                     stats["failed"] += 1
+                    _finish_item(action, rel, BiSyncItemStatus.FAILED, str(e))
 
         # 11. 文件/目录同名冲突：计失败（已在计划阶段跳过，不破坏两侧数据）
         for rel in plan["type_conflicts"]:
+            action = BiSyncAction.TYPE_CONFLICT
+            _start_item(action, rel, 1)
             stats["failed"] += 1
+            error = "文件与目录同名冲突"
+            _finish_item(action, rel, BiSyncItemStatus.FAILED, error)
             logger.error("双向同步文件/目录同名冲突，已跳过: %s", rel)
+
+        # 12. 明确报告被配置阻止的删除传播，避免误报“已是最新”
+        for rel in plan.get("keep_local", ()):
+            message = "未启用云端删除到本地回收站，已保留本地文件"
+            _block_item(BiSyncAction.KEEP_LOCAL, rel, message)
+            logger.info("双向同步保留本地文件: %s (%s)", rel, message)
+        for rel in plan.get("keep_remote", ()):
+            message = "未启用本地删除到云端，已保留云端文件"
+            _block_item(BiSyncAction.KEEP_REMOTE, rel, message)
+            logger.info("双向同步保留云端文件: %s (%s)", rel, message)
 
         # 同步可能改变了云端结构，标记缓存失效
         self._file.mark_all_dirs_dirty()
 
         logger.info(
             "双向同步完成: job=%s, 新增=%d, 更新=%d, 下载=%d, 冲突=%d, "
-            "删云端=%d, 删本地=%d, 失败=%d",
+            "删云端=%d, 删本地=%d, 失败=%d, 跳过=%d",
             job.get("name"), stats["added"], stats["updated"],
             stats["downloaded"], stats["conflicts"],
             stats["deleted_remote"], stats["deleted_local"], stats["failed"],
+            stats["skipped"],
         )
-        return True, stats
+        return not download_blocked, stats
 
     # ---- 内部实现 ----
 
@@ -568,7 +954,8 @@ class BiSyncService(SyncService):
                 time.sleep(3)
         return None
 
-    def _download_one(self, item, local_root, rel, cancel):
+    def _download_one(self, item, local_root, rel, cancel,
+                      progress_callback=None, retry_callback=None):
         """下载单个云端文件到本地相对路径。
 
         Returns:
@@ -582,18 +969,40 @@ class BiSyncService(SyncService):
         except OSError as e:
             raise RuntimeError(f"创建本地目录失败: {e}") from e
 
-        url = self._download.link_by_fileDetail(item)
-        if not isinstance(url, str):
-            raise RuntimeError(f"获取下载链接失败 (code={url})")
+        url = None
+        for attempt in range(len(self._link_retry_delays) + 1):
+            try:
+                url = self._download.require_download_link(item)
+                break
+            except DownloadLinkError as error:
+                if error.code != 24010 or attempt >= len(self._link_retry_delays):
+                    raise
+                delay = self._link_retry_delays[attempt]
+                logger.warning(
+                    "获取下载链接返回 24010，第 %d 次重试前等待 %s 秒: %s",
+                    attempt + 1,
+                    delay,
+                    error.message,
+                )
+                if retry_callback:
+                    retry_callback(error, delay, attempt + 1)
+                if not self._wait_with_cancel(delay, cancel):
+                    return False
 
         cancel_event = _CancelEventAdapter(cancel) if cancel is not None else None
         ok = self._download.download_file(
-            url, target, size, cancel_event=cancel_event
+            url,
+            target,
+            size,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
         if not ok:
             if cancel is not None and getattr(cancel, "is_cancelled", False):
                 return False
             raise RuntimeError("下载失败")
+        if progress_callback:
+            progress_callback(size, size)
 
         # 本地 mtime 对齐云端 UpdateAt：跨机同步后指纹稳定
         updateat = self._remote_updateat(item)
