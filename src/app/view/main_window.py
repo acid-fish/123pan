@@ -8,7 +8,7 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
 
-from PySide6.QtCore import QThreadPool, QTimer
+from PySide6.QtCore import QThreadPool, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QAbstractScrollArea, QDialog, QMenu, QSystemTrayIcon
 
@@ -144,9 +144,14 @@ class MainWindow(FluentWindow):
         screen = QGuiApplication.primaryScreen()
         if screen is None:
             return
-        frame = self.frameGeometry()
-        frame.moveCenter(screen.availableGeometry().center())
-        self.move(frame.topLeft())
+        area = screen.availableGeometry()
+        rect = self.style().alignedRect(
+            Qt.LayoutDirectionAuto,
+            Qt.AlignmentFlag.AlignCenter,
+            self.size(),
+            area,
+        )
+        self.setGeometry(rect)
 
     def _initNavigation(self):
         self.addSubInterface(self.file_interface, FIF.FOLDER, tr("nav.file", "文件"))
