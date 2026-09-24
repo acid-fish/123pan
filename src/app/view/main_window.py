@@ -56,18 +56,18 @@ class MainWindow(FluentWindow):
     _CENTER_TOLERANCE = 3
 
     def __init__(self):
+        # 基类构造期间（原生 Windows 平台）可能触发 moveEvent，
+        # 必须先把居中状态标志初始化，再调用基类构造。
+        self._center_on_first_show = True
+        self._centering_active = False
+        self._center_target = None
+        self._center_settle_checks = 0
+        self._center_fixes = 0
         super().__init__()
         #self.stackedWidget.setAnimationEnabled(False)
         self.setWindowTitle("123pan")
         self.resize(1200, 800)
         self.setMinimumSize(760, 520)
-        self._center_on_first_show = True
-        # 首次居中收敛状态：窗口显示后平台可能异步改写几何，
-        # 保持活跃直至 frame 中心连续稳定。
-        self._centering_active = False
-        self._center_target = None
-        self._center_settle_checks = 0
-        self._center_fixes = 0
         logger.info("MainWindow 初始化")
 
         # Linux 下禁用 Mica 效果，避免 "This plugin does not support setting window opacity" 错误
