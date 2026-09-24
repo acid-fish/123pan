@@ -1,0 +1,94 @@
+name: Build 123pan (Windows x64 only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "构建成功后是否创建 Release"
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: "版本号 (例如: v4.0.5)，仅在勾选创建 Release 时使用"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          architecture: x64
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.0
+
+      - name: Install dependencies
+        env:
+          UV_INDEX_URL: https://pypi.org/simple
+          UV_HTTP_TIMEOUT: "120"
+          UV_HTTP_RETRIES: "5"
+        run: |
+          uv sync --group build --group test --group lint
+
+      - name: Check Source
+        run: |
+          bash ./script/test.sh && echo && bash script/lint.sh src/
+        shell: bash
+
+      - name: Build with Nuitka
+        env:
+          BUILD_ARCH: x64
+        run: |
+          bash script/build.sh
+        shell: bash
+
+      - name: Package Windows build
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "123pan.dist" `
+            -DestinationPath "123pan-windows-x64.zip" `
+            -CompressionLevel Optimal `
+            -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: 123pan-windows-x64
+          path: 123pan-windows-x64.zip
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    if: ${{ github.event.inputs.create_release == 'true' && github.event.inputs.version != '' }}
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: 123pan-windows-x64
+          path: ./artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: ${{ github.event.inputs.version }}
+          files: ./artifacts/123pan-windows-x64.zip
+          prerelease: false
+          generate_release_notes: false
