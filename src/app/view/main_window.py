@@ -155,8 +155,11 @@ class MainWindow(FluentWindow):
     def __recenter_frame_to(self, center):
         """按实测 frame 中心与目标中心的差值纠偏窗口位置。"""
         delta = center - self.frameGeometry().center()
-        if not delta.isNull():
-            self.move(self.pos() + delta)
+        if delta.isNull():
+            return
+        geometry = self.geometry()
+        geometry.moveTopLeft(geometry.topLeft() + delta)
+        self.setGeometry(geometry)
 
     def _initNavigation(self):
         self.addSubInterface(self.file_interface, FIF.FOLDER, tr("nav.file", "文件"))
