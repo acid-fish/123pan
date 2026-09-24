@@ -75,7 +75,12 @@ class TestMainWindowGeometry:
         assert window.height() == 800
         assert screen is not None
         delta = window.frameGeometry().center() - screen.availableGeometry().center()
-        assert abs(delta.x()) <= 1
+        assert abs(delta.x()) <= 1, (
+            f"delta={delta} pos={window.pos()} geometry={window.geometry()} "
+            f"frame={window.frameGeometry()} area={screen.availableGeometry()} "
+            f"screen={screen.geometry()} dpr={screen.devicePixelRatio()} "
+            f"platform={qapp.platformName()}"
+        )
         assert abs(delta.y()) <= 1
 
         window.close()

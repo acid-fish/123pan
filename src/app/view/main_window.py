@@ -148,18 +148,42 @@ class MainWindow(FluentWindow):
         frame = self.frameGeometry()
         frame.moveCenter(area.center())
         self.move(frame.topLeft())
-        # Windows 平台边框/阴影尺寸非对称且可能在窗口完全显示后才生效，
-        # 事件循环启动后按实测 frame 再纠偏一次，保证 frame 中心与屏幕中心重合。
-        QTimer.singleShot(0, lambda: self.__recenter_frame_to(area.center()))
+        logger.info(
+            "center_on_show: platform=%s dpr=%s screen=%s area=%s pos=%s geometry=%s frame=%s",
+            QGuiApplication.platformName(),
+            screen.devicePixelRatio(),
+            screen.geometry(),
+            area,
+            self.pos(),
+            self.geometry(),
+            self.frameGeometry(),
+        )
+        # Windows CI 等平台在窗口显示后才完成原生几何修正，
+        # 事件循环启动后按实测 frame 纠偏，最多重试几次直至收敛。
+        QTimer.singleShot(0, lambda: self.__recenter_frame_to(area.center(), 0))
 
-    def __recenter_frame_to(self, center):
+    def __recenter_frame_to(self, center, attempt):
         """按实测 frame 中心与目标中心的差值纠偏窗口位置。"""
         delta = center - self.frameGeometry().center()
+        logger.info(
+            "recenter attempt=%s: target=%s delta=%s pos=%s geometry=%s frame=%s",
+            attempt, center, delta, self.pos(), self.geometry(), self.frameGeometry(),
+        )
         if delta.isNull():
             return
         geometry = self.geometry()
         geometry.moveTopLeft(geometry.topLeft() + delta)
         self.setGeometry(geometry)
+        if attempt < 3:
+            QTimer.singleShot(0, lambda: self.__recenter_frame_to(center, attempt + 1))
+
+    def moveEvent(self, event):
+        """诊断日志：跟踪所有窗口移动（用于定位 Windows CI 几何偏移）。"""
+        super().moveEvent(event)
+        logger.info(
+            "moveEvent: pos=%s geometry=%s frame=%s",
+            self.pos(), self.geometry(), self.frameGeometry(),
+        )
 
     def _initNavigation(self):
         self.addSubInterface(self.file_interface, FIF.FOLDER, tr("nav.file", "文件"))
