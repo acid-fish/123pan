@@ -51,6 +51,10 @@ class _LazyTransferProxy:
 
 
 class MainWindow(FluentWindow):
+    # 居中收敛时，小于该值的偏移视为平台几何修正（如边框/阴影），
+    # 大于该值的位移视为用户拖动窗口。
+    _CENTER_TOLERANCE = 3
+
     def __init__(self):
         super().__init__()
         #self.stackedWidget.setAnimationEnabled(False)
@@ -58,6 +62,12 @@ class MainWindow(FluentWindow):
         self.resize(1200, 800)
         self.setMinimumSize(760, 520)
         self._center_on_first_show = True
+        # 首次居中收敛状态：窗口显示后平台可能异步改写几何，
+        # 保持活跃直至 frame 中心连续稳定。
+        self._centering_active = False
+        self._center_target = None
+        self._center_settle_checks = 0
+        self._center_fixes = 0
         logger.info("MainWindow 初始化")
 
         # Linux 下禁用 Mica 效果，避免 "This plugin does not support setting window opacity" 错误
@@ -144,46 +154,78 @@ class MainWindow(FluentWindow):
         screen = QGuiApplication.primaryScreen()
         if screen is None:
             return
-        area = screen.availableGeometry()
+        self._center_target = screen.availableGeometry().center()
+        self._center_settle_checks = 0
+        self._center_fixes = 0
         frame = self.frameGeometry()
-        frame.moveCenter(area.center())
+        frame.moveCenter(self._center_target)
         self.move(frame.topLeft())
+        self._centering_active = True
         logger.info(
             "center_on_show: platform=%s dpr=%s screen=%s area=%s pos=%s geometry=%s frame=%s",
             QGuiApplication.platformName(),
             screen.devicePixelRatio(),
             screen.geometry(),
-            area,
+            screen.availableGeometry(),
             self.pos(),
             self.geometry(),
             self.frameGeometry(),
         )
-        # Windows CI 等平台在窗口显示后才完成原生几何修正，
-        # 事件循环启动后按实测 frame 纠偏，最多重试几次直至收敛。
-        QTimer.singleShot(0, lambda: self.__recenter_frame_to(area.center(), 0))
+        # Windows CI 等平台在窗口显示后会异步改写窗口几何，
+        # 居中期间持续盯防（含 moveEvent 触发），直到 frame 中心稳定。
+        QTimer.singleShot(0, self.__check_frame_center)
 
-    def __recenter_frame_to(self, center, attempt):
-        """按实测 frame 中心与目标中心的差值纠偏窗口位置。"""
-        delta = center - self.frameGeometry().center()
+    def __check_frame_center(self):
+        """居中收敛检查：微小偏差纠偏，大位移视为用户接管。"""
+        if not self._centering_active:
+            return
+        delta = self._center_target - self.frameGeometry().center()
         logger.info(
-            "recenter attempt=%s: target=%s delta=%s pos=%s geometry=%s frame=%s",
-            attempt, center, delta, self.pos(), self.geometry(), self.frameGeometry(),
+            "check_frame_center: target=%s delta=%s pos=%s geometry=%s frame=%s",
+            self._center_target, delta, self.pos(), self.geometry(), self.frameGeometry(),
         )
+        if abs(delta.x()) > self._CENTER_TOLERANCE or abs(delta.y()) > self._CENTER_TOLERANCE:
+            # 用户已移动窗口，放弃居中
+            self._centering_active = False
+            return
         if delta.isNull():
+            self._center_settle_checks += 1
+            if self._center_settle_checks >= 4:
+                self._centering_active = False
+            else:
+                QTimer.singleShot(0, self.__check_frame_center)
+            return
+        self._center_settle_checks = 0
+        self._center_fixes += 1
+        if self._center_fixes > 6:
+            self._centering_active = False
             return
         geometry = self.geometry()
         geometry.moveTopLeft(geometry.topLeft() + delta)
         self.setGeometry(geometry)
-        if attempt < 3:
-            QTimer.singleShot(0, lambda: self.__recenter_frame_to(center, attempt + 1))
+        QTimer.singleShot(0, self.__check_frame_center)
 
     def moveEvent(self, event):
-        """诊断日志：跟踪所有窗口移动（用于定位 Windows CI 几何偏移）。"""
+        """居中期间微小偏移（平台几何修正）立即纠偏；用户位移不干预。"""
         super().moveEvent(event)
+        if not self._centering_active:
+            return
+        delta = self._center_target - self.frameGeometry().center()
+        if abs(delta.x()) > self._CENTER_TOLERANCE or abs(delta.y()) > self._CENTER_TOLERANCE:
+            return
         logger.info(
             "moveEvent: pos=%s geometry=%s frame=%s",
             self.pos(), self.geometry(), self.frameGeometry(),
         )
+        if delta.isNull():
+            return
+        self._center_fixes += 1
+        if self._center_fixes > 6:
+            self._centering_active = False
+            return
+        geometry = self.geometry()
+        geometry.moveTopLeft(geometry.topLeft() + delta)
+        self.setGeometry(geometry)
 
     def _initNavigation(self):
         self.addSubInterface(self.file_interface, FIF.FOLDER, tr("nav.file", "文件"))
