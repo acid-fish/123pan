@@ -186,9 +186,7 @@ class SyncService:
         code, items = self._fetch_dir_with_retry(dir_id, cancel)
         if code != 0:
             logger.error("获取云端目录失败: dir_id=%s, code=%s", dir_id, code)
-            self.last_error = "获取云端目录失败: dir_id={}, code={}".format(
-                dir_id, code
-            )
+            self.last_error = f"获取云端目录失败: dir_id={dir_id}, code={code}"
             return False
         for item in items:
             name = item.get("FileName", "")
@@ -294,7 +292,7 @@ class SyncService:
         # 安全校验：本地目录必须存在，避免误删云端数据
         if not os.path.isdir(local_root):
             logger.error("同步本地目录不存在或不可访问: %s", local_root)
-            self.last_error = "本地目录不存在: {}".format(local_root)
+            self.last_error = f"本地目录不存在: {local_root}"
             return False, stats
 
         # 1. 本地索引
@@ -309,7 +307,7 @@ class SyncService:
         if remote_index is None:
             logger.error("获取云端目录失败，中止同步: dir_id=%s", remote_root)
             self.last_error = self.last_error or (
-                "获取云端目录失败: dir_id={}".format(remote_root)
+                f"获取云端目录失败: dir_id={remote_root}"
             )
             return False, stats
 
