@@ -9,6 +9,7 @@ the Free Software Foundation, either version 3 of the License, or
 """
 
 import os
+import time
 from pathlib import Path
 
 from ..common.log import get_logger
@@ -24,6 +25,14 @@ PHASE_SCAN_REMOTE = "scan_remote"
 PHASE_UPLOAD = "upload"
 PHASE_DELETE = "delete"
 
+# 递归扫描云端目录时，两次目录列表请求之间的最小间隔（秒）。
+# 服务端对列表接口有频控（code=100011），目录多时连续请求会触发。
+_DIR_SCAN_THROTTLE_SECONDS = 0.3
+# 触发退避重试的服务端频控码
+_SCAN_RATE_LIMIT_CODES = frozenset({100011})
+# 限流后的退避等待序列（秒），全部用尽仍失败才中止扫描
+_DEFAULT_SCAN_RETRY_DELAYS = (3, 10, 30)
+
 
 class SyncService:
     """文件夹同步服务。
@@ -35,16 +44,34 @@ class SyncService:
     - 不持有 Qt 依赖，可由后台线程调用
     """
 
-    def __init__(self, session, account_name=None):
+    def __init__(self, session, account_name=None, scan_retry_delays=None):
         self._session = session
         self._upload = UploadService(session)
         self._file = FileService(session, account_name)
         self._store = SyncStore()
+        self._scan_retry_delays = (
+            _DEFAULT_SCAN_RETRY_DELAYS
+            if scan_retry_delays is None
+            else tuple(scan_retry_delays)
+        )
+        # 最近一次中止同步的失败原因（供任务层生成可读摘要）
+        self.last_error = None
 
     def set_account(self, account_name):
         self._file.set_account(account_name)
 
     # ---- 索引构建 ----
+
+    @staticmethod
+    def _cancellable_sleep(seconds, cancel=None, step=0.2):
+        """可中断的休眠：按 step 分片睡眠，取消时提前返回 False。"""
+        remaining = float(seconds)
+        while remaining > 0:
+            if cancel is not None and getattr(cancel, "is_cancelled", False):
+                return False
+            time.sleep(min(step, remaining))
+            remaining -= step
+        return True
 
     def build_local_index(self, local_root):
         """扫描本地目录树。
@@ -105,11 +132,12 @@ class SyncService:
                 }
         return index
 
-    def build_remote_index(self, remote_dir_id):
+    def build_remote_index(self, remote_dir_id, cancel=None):
         """递归获取云端目录树（强制刷新，保证对比数据最新）。
 
         Args:
             remote_dir_id: 云端目标目录 ID（0 表示根目录）
+            cancel: 可选对象，具备 is_cancelled 属性，置位后中止扫描
 
         Returns:
             {rel_path: 云端文件/目录 item dict}，rel_path 以 '/' 分隔。
@@ -117,15 +145,50 @@ class SyncService:
             ——否则会把远端误判为空目录，导致误传/误删。
         """
         index = {}
-        ok = self._build_remote_recursive(int(remote_dir_id), "", index)
+        self.last_error = None
+        ok = self._build_remote_recursive(int(remote_dir_id), "", index, cancel)
         return index if ok else None
 
-    def _build_remote_recursive(self, dir_id, rel_dir, index):
+    def _fetch_dir_with_retry(self, dir_id, cancel=None):
+        """获取单个目录列表，遇到服务端限流（code=100011）时退避重试。
+
+        Returns:
+            (code, items)；重试耗尽或取消时 code 不为 0。
+        """
         code, items, *_ = self._file.get_dir_by_id(
             dir_id, all=True, limit=100, force_refresh=True
         )
+        if code == 0 or code not in _SCAN_RATE_LIMIT_CODES:
+            return code, items
+        for delay in self._scan_retry_delays:
+            logger.warning(
+                "云端目录列表被限流: dir_id=%s, code=%s, %s 秒后重试",
+                dir_id, code, delay,
+            )
+            if not self._cancellable_sleep(delay, cancel):
+                logger.warning("扫描被取消，停止限流重试: dir_id=%s", dir_id)
+                return code, items
+            code, items, *_ = self._file.get_dir_by_id(
+                dir_id, all=True, limit=100, force_refresh=True
+            )
+            if code == 0:
+                return code, items
+            if code not in _SCAN_RATE_LIMIT_CODES:
+                return code, items
+        return code, items
+
+    def _build_remote_recursive(self, dir_id, rel_dir, index, cancel=None):
+        # 根目录请求前不节流；每个子目录请求之间留出间隔，避免触发频控
+        if rel_dir and not self._cancellable_sleep(
+            _DIR_SCAN_THROTTLE_SECONDS, cancel
+        ):
+            return False
+        code, items = self._fetch_dir_with_retry(dir_id, cancel)
         if code != 0:
             logger.error("获取云端目录失败: dir_id=%s, code=%s", dir_id, code)
+            self.last_error = "获取云端目录失败: dir_id={}, code={}".format(
+                dir_id, code
+            )
             return False
         for item in items:
             name = item.get("FileName", "")
@@ -134,7 +197,9 @@ class SyncService:
             rel = f"{rel_dir}/{name}" if rel_dir else name
             index[rel] = item
             if int(item.get("Type", 0)) == 1:
-                if not self._build_remote_recursive(item["FileId"], rel, index):
+                if not self._build_remote_recursive(
+                    item["FileId"], rel, index, cancel
+                ):
                     return False
         return True
 

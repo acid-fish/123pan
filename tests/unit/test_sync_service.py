@@ -92,6 +92,104 @@ class TestBuildLocalIndex:
         assert "outside.txt" not in index
 
 
+class TestBuildRemoteIndex:
+    @staticmethod
+    def _item(name, file_id, is_dir=False):
+        return {
+            "FileName": name,
+            "FileId": file_id,
+            "Type": 1 if is_dir else 2,
+            "Size": 0,
+            "UpdateAt": "2026-09-26 00:00:00",
+        }
+
+    def test_scan_builds_nested_index(self, mocker):
+        svc = _make_svc()
+
+        def fake_list(dir_id, **kwargs):
+            if dir_id == 0:
+                return 0, [self._item("docs", 10, is_dir=True), self._item("a.txt", 11)], 2, True, 1
+            if dir_id == 10:
+                return 0, [self._item("b.txt", 12)], 1, True, 1
+            raise AssertionError("unexpected dir_id=%s" % dir_id)
+
+        mocker.patch.object(svc._file, "get_dir_by_id", side_effect=fake_list)
+        mocker.patch("src.app.service.sync_service.time.sleep")
+
+        index = svc.build_remote_index(0)
+
+        assert index is not None
+        assert "a.txt" in index
+        assert "docs/b.txt" in index
+        assert svc.last_error is None
+
+    def test_rate_limit_retries_then_recovers(self, tmp_path, mocker):
+        svc = SyncService(_DummySession(), scan_retry_delays=(0.01, 0.02))
+        calls = []
+
+        def fake_list(dir_id, **kwargs):
+            calls.append(dir_id)
+            if len(calls) == 1:
+                return 100011, [], 0, False, 0
+            return 0, [], 0, True, 1
+
+        mocker.patch.object(svc._file, "get_dir_by_id", side_effect=fake_list)
+        mocker.patch("src.app.service.sync_service.time.sleep")
+
+        index = svc.build_remote_index(0)
+
+        assert index is not None
+        assert len(calls) == 2
+        assert svc.last_error is None
+
+    def test_rate_limit_exhausted_aborts(self, mocker):
+        svc = SyncService(_DummySession(), scan_retry_delays=(0.01,))
+        mocker.patch.object(
+            svc._file, "get_dir_by_id",
+            return_value=(100011, [], 0, False, 0),
+        )
+        mocker.patch("src.app.service.sync_service.time.sleep")
+
+        index = svc.build_remote_index(0)
+
+        assert index is None
+        assert svc.last_error is not None
+        assert "100011" in svc.last_error
+
+    def test_throttle_between_subdirs(self, mocker):
+        svc = SyncService(_DummySession(), scan_retry_delays=())
+
+        def fake_list(dir_id, **kwargs):
+            if dir_id == 0:
+                return 0, [self._item("d1", 10, is_dir=True), self._item("d2", 20, is_dir=True)], 2, True, 1
+            return 0, [], 0, True, 1
+
+        mocker.patch.object(svc._file, "get_dir_by_id", side_effect=fake_list)
+        sleep = mocker.patch("src.app.service.sync_service.time.sleep")
+
+        svc.build_remote_index(0)
+
+        # 根目录不节流；两个子目录各节流 0.3s（睡眠可分片，按总时长判断）
+        total = sum(call.args[0] for call in sleep.call_args_list)
+        assert total == 2 * 0.3
+
+    def test_cancel_aborts_scan(self, mocker):
+        svc = SyncService(_DummySession(), scan_retry_delays=())
+
+        def fake_list(dir_id, **kwargs):
+            if dir_id == 0:
+                return 0, [self._item("d1", 10, is_dir=True)], 1, True, 1
+            return 0, [], 0, True, 1
+
+        mocker.patch.object(svc._file, "get_dir_by_id", side_effect=fake_list)
+        mocker.patch("src.app.service.sync_service.time.sleep")
+        cancel = SimpleNamespace(is_cancelled=True)
+
+        index = svc.build_remote_index(0, cancel=cancel)
+
+        assert index is None
+
+
 class TestComputeChanges:
     def test_first_sync_uploads_all_new(self, tmp_db, tmp_path):
         root = _local_root(tmp_path)
