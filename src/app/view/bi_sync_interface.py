@@ -548,6 +548,7 @@ class BiSyncInterface(QWidget):
             content=tr(
                 "bisync.msg_run_all_desc", "已启动全部启用中的双向同步任务"
             ),
+            duration=3000,
             parent=self,
         )
 
@@ -583,12 +584,14 @@ class BiSyncInterface(QWidget):
             InfoBar.success(
                 title=tr("bisync.msg_run_done", "同步完成"),
                 content=summary,
+                duration=3000,
                 parent=self,
             )
         else:
             InfoBar.error(
                 title=tr("bisync.msg_run_failed", "同步失败"),
                 content=summary,
+                duration=3000,
                 parent=self,
             )
 
