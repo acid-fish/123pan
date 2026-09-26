@@ -385,6 +385,8 @@ class TestRunBiSync:
         success, stats = svc.run_bi_sync(job)
         assert success is False
         assert stats["deleted_remote"] == 0
+        assert svc.last_error is not None
+        assert "获取云端目录失败" in svc.last_error
 
     def test_cancel_before_run(self, tmp_db, tmp_path):
         root = self._prepare_local(tmp_path)

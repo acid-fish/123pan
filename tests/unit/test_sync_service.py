@@ -422,6 +422,8 @@ class TestRunSync:
 
         ok, stats = svc.run_sync(job)
         assert ok is False
+        assert svc.last_error is not None
+        assert "code=2" in svc.last_error
         upload.assert_not_called()
         trash.assert_not_called()
 
@@ -439,5 +441,7 @@ class TestRunSync:
 
         ok, stats = svc.run_sync(job)
         assert ok is False
+        assert svc.last_error is not None
+        assert "本地目录不存在" in svc.last_error
         upload.assert_not_called()
         trash.assert_not_called()

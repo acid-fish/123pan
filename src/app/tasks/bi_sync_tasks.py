@@ -121,6 +121,11 @@ class BiSyncRunThread(QThread):
 
             summary = self._build_summary(stats, cancelled)
             run_success = success and not cancelled
+            reason = ""
+            if not run_success and not cancelled:
+                reason = getattr(service, "last_error", None) or ""
+                if reason:
+                    summary = tr("bisync.failed_reason", "同步失败：{}").format(reason)
             run_status = (
                 BiSyncItemStatus.CANCELLED
                 if cancelled
@@ -140,7 +145,9 @@ class BiSyncRunThread(QThread):
                 )
             )
             self.signals.finished.emit(job_id, run_success, summary, stats)
-            self._record_history(store, job_id, job_name, started_at, status, stats)
+            self._record_history(
+                store, job_id, job_name, started_at, status, stats, message=reason
+            )
         except Exception as e:
             logger.error("双向同步运行异常: job=%s, err=%s", job_name, e)
             summary = tr("bisync.error_run", "同步失败: {}").format(e)

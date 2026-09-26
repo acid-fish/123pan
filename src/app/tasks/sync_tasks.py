@@ -82,8 +82,15 @@ class SyncRunThread(QThread):
                 status = "failed"
 
             summary = self._build_summary(stats, cancelled)
+            reason = ""
+            if not success and not cancelled:
+                reason = getattr(service, "last_error", None) or ""
+                if reason:
+                    summary = tr("sync.failed_reason", "同步失败：{}").format(reason)
             self.signals.finished.emit(job_id, success and not cancelled, summary, stats)
-            self._record_history(store, job_id, job_name, started_at, status, stats)
+            self._record_history(
+                store, job_id, job_name, started_at, status, stats, message=reason
+            )
         except Exception as e:
             logger.error("同步运行异常: job=%s, err=%s", job_name, e)
             summary = tr("sync.error_run", "同步失败: {}").format(e)
