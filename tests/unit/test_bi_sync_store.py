@@ -158,17 +158,21 @@ class TestHistory:
         )
         store.add_history(
             job_id, "h", "2026-01-01T00:00:00", finished_at="2026-01-01T00:01:00",
-            added=1, updated=2, downloaded=3, deleted=4, conflicts=5,
-            failed=6, status="completed",
+            added=1, updated=2, downloaded=3, deleted_remote=4, deleted_local=5,
+            conflicts=6, failed=7, skipped=8, status="completed",
         )
         rows = store.get_history()
         assert len(rows) == 1
         row = rows[0]
         assert row["job_id"] == job_id
         assert row["downloaded"] == 3
-        assert row["conflicts"] == 5
-        assert row["deleted"] == 4
+        assert row["deleted_remote"] == 4
+        assert row["deleted_local"] == 5
+        assert row["conflicts"] == 6
+        assert row["failed"] == 7
+        assert row["skipped"] == 8
         assert row["status"] == "completed"
+        assert "deleted" not in row  # 旧合并列不再出现在新记录查询中
 
     def test_job_history_and_clear(self, tmp_db):
         store = BiSyncStore()
@@ -179,3 +183,58 @@ class TestHistory:
         assert len(store.get_job_history(a)) == 1
         store.clear_history()
         assert store.get_history() == []
+
+
+class TestHistoryMigration:
+    def test_legacy_deleted_column_upgraded(self, tmp_path):
+        """旧库（合并 deleted 列）初始化时自动补齐新列。"""
+        import sqlite3
+        from src.app.common.database import Database
+
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """CREATE TABLE bi_sync_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      INTEGER NOT NULL DEFAULT 0,
+                job_name    TEXT NOT NULL DEFAULT '',
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT '',
+                added       INTEGER NOT NULL DEFAULT 0,
+                updated     INTEGER NOT NULL DEFAULT 0,
+                downloaded  INTEGER NOT NULL DEFAULT 0,
+                deleted     INTEGER NOT NULL DEFAULT 0,
+                conflicts   INTEGER NOT NULL DEFAULT 0,
+                failed      INTEGER NOT NULL DEFAULT 0,
+                status      TEXT NOT NULL DEFAULT 'completed',
+                message     TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO bi_sync_history (job_id, job_name, started_at, deleted)"
+            " VALUES (1, 'legacy', 't0', 7)"
+        )
+        conn.commit()
+        conn.close()
+
+        Database.set_path(db_path)
+        try:
+            Database()  # 触发建表与迁移
+            store = BiSyncStore()
+            rows = store.get_history()
+            assert len(rows) == 1
+            # 旧记录新列补 0（旧 deleted 无法区分云端/本地，不搬运）
+            assert int(rows[0]["deleted_remote"]) == 0
+            assert int(rows[0]["deleted_local"]) == 0
+            assert int(rows[0]["skipped"]) == 0
+
+            # 迁移后新写入使用新字段
+            store.add_history(
+                1, "legacy", "t1", deleted_remote=2, deleted_local=3, skipped=4
+            )
+            row = store.get_history()[0]
+            assert int(row["deleted_remote"]) == 2
+            assert int(row["deleted_local"]) == 3
+            assert int(row["skipped"]) == 4
+        finally:
+            Database.reset()

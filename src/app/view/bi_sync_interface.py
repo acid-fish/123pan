@@ -10,7 +10,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -45,7 +45,7 @@ from ..common.bi_sync_store import (
 from ..common.i18n import tr
 from ..common.log import get_logger
 from ..common.style_sheet import StyleSheet
-from ..common.utils import configure_resizable_header
+from ..common.utils import configure_resizable_header, format_db_time
 from .folder_select_dialog import FolderSelectDialog
 from .sync_interface import _SYNC_INTERVALS, _interval_index
 
@@ -57,6 +57,10 @@ _CONFLICT_POLICIES = [
     (CONFLICT_LOCAL_WINS, tr("bisync.conflict_local_wins", "以本地为准")),
     (CONFLICT_REMOTE_WINS, tr("bisync.conflict_remote_wins", "以云端为准")),
 ]
+
+# 任务表操作列宽度：4 个 30px 图标按钮 + 3×2px 间距 + 单元格边距
+# （resizeColumnsToContents 不计入 cellWidget，需手动指定）
+_ACTION_COL_WIDTH = 4 * 30 + 3 * 2 + 12
 
 
 def _conflict_index(policy):
@@ -382,12 +386,14 @@ class BiSyncInterface(QWidget):
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self.jobsTable.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        configure_resizable_header(
+        # 任务表每次刷新后按内容自适应列宽，default_widths 仅作空表初始值；
+        # 右侧保留 100px 空白，stretch 列只吸收扣除空白后的多余宽度
+        self._jobs_stretch = configure_resizable_header(
             self.jobsTable,
             stretch_column=2,
-            default_widths={0: 80, 1: 180, 2: 300, 3: 180, 4: 100, 5: 160},
+            default_widths={0: 80, 1: 180, 2: 300, 3: 180, 4: 100, 5: 160, 6: _ACTION_COL_WIDTH},
+            right_padding=100,
         )
-        self.jobsTable.setColumnWidth(6, 200)
         self.jobsLayout.addWidget(self.jobsTable)
 
         # ---- 历史表格 ----
@@ -410,23 +416,29 @@ class BiSyncInterface(QWidget):
 
         self.historyTable = TableWidget(self.historyFrame)
         self.historyTable.setAlternatingRowColors(True)
-        self.historyTable.setColumnCount(8)
+        self.historyTable.setColumnCount(11)
         self.historyTable.setHorizontalHeaderLabels([
             tr("bisync.h_col_job", "任务"),
             tr("bisync.h_col_status", "结果"),
             tr("bisync.h_col_added", "新增"),
             tr("bisync.h_col_updated", "更新"),
             tr("bisync.h_col_downloaded", "下载"),
-            tr("bisync.h_col_deleted", "删除"),
             tr("bisync.h_col_conflicts", "冲突"),
+            tr("bisync.h_col_del_remote", "删云端"),
+            tr("bisync.h_col_del_local", "删本地"),
+            tr("bisync.h_col_failed", "失败"),
+            tr("bisync.h_col_skipped", "跳过"),
             tr("bisync.h_col_time", "时间"),
         ])
         self.historyTable.setBorderRadius(8)
         self.historyTable.setBorderVisible(True)
-        configure_resizable_header(
+        # 历史表每次刷新后按内容自适应列宽，default_widths 仅作空表初始值；
+        # 右侧保留 100px 空白，同任务表
+        self._history_stretch = configure_resizable_header(
             self.historyTable,
             stretch_column=0,
-            default_widths={0: 200, 1: 80, 2: 60, 3: 60, 4: 60, 5: 60, 6: 60, 7: 150},
+            default_widths={0: 200, 10: 150},
+            right_padding=100,
         )
         self.historyLayout.addWidget(self.historyTable)
 
@@ -650,16 +662,19 @@ class BiSyncInterface(QWidget):
                 )
                 self.jobsTable.setItem(row, 4, QTableWidgetItem(interval_text))
 
-                last_run = job.get("last_run_at") or ""
-                last_text = (
-                    str(last_run).replace("T", " ").split(".", maxsplit=1)[0]
-                    if last_run else "-"
+                self.jobsTable.setItem(
+                    row, 5, QTableWidgetItem(format_db_time(job.get("last_run_at")))
                 )
-                self.jobsTable.setItem(row, 5, QTableWidgetItem(last_text))
 
                 self.__set_job_actions(row, job, is_running)
         finally:
             self.jobsTable.setUpdatesEnabled(True)
+        # 按内容自适应列宽；操作列为按钮组合（不计入内容计算）单独指定宽度。
+        # stretch 延迟到事件循环下一拍，确保 tab 切换/首帧布局稳定后
+        # 基于最终 viewport 计算（布局中间态 viewport 会拉过冲）
+        self.jobsTable.resizeColumnsToContents()
+        self.jobsTable.setColumnWidth(6, _ACTION_COL_WIDTH)
+        QTimer.singleShot(0, self._jobs_stretch)
 
     def __set_job_actions(self, row, job, is_running):
         """构建任务行操作按钮（紧凑图标按钮，带悬停提示）。"""
@@ -702,13 +717,6 @@ class BiSyncInterface(QWidget):
 
         _tool_button(FIF.DELETE, tr("bisync.btn_delete", "删除"), self.__delete_job)
 
-        del_btn = PushButton(
-            FIF.DELETE.icon(), tr("bisync.btn_delete", "删除"), self.jobsTable
-        )
-        del_btn.setFixedSize(64, 24)
-        del_btn.clicked.connect(lambda _, j=job: self.__delete_job(j))
-        action_layout.addWidget(del_btn)
-
         widget = QWidget()
         widget.setLayout(action_layout)
         self.jobsTable.setCellWidget(row, 6, widget)
@@ -743,13 +751,25 @@ class BiSyncInterface(QWidget):
                     i, 4, QTableWidgetItem(str(row.get("downloaded", 0)))
                 )
                 self.historyTable.setItem(
-                    i, 5, QTableWidgetItem(str(row.get("deleted", 0)))
+                    i, 5, QTableWidgetItem(str(row.get("conflicts", 0)))
                 )
                 self.historyTable.setItem(
-                    i, 6, QTableWidgetItem(str(row.get("conflicts", 0)))
+                    i, 6, QTableWidgetItem(str(row.get("deleted_remote", 0)))
                 )
-                finished = row.get("finished_at") or ""
-                time_text = str(finished).replace("T", " ").split(".", maxsplit=1)[0]
-                self.historyTable.setItem(i, 7, QTableWidgetItem(time_text))
+                self.historyTable.setItem(
+                    i, 7, QTableWidgetItem(str(row.get("deleted_local", 0)))
+                )
+                self.historyTable.setItem(
+                    i, 8, QTableWidgetItem(str(row.get("failed", 0)))
+                )
+                self.historyTable.setItem(
+                    i, 9, QTableWidgetItem(str(row.get("skipped", 0)))
+                )
+                self.historyTable.setItem(
+                    i, 10, QTableWidgetItem(format_db_time(row.get("finished_at")))
+                )
         finally:
             self.historyTable.setUpdatesEnabled(True)
+        # 按内容自适应列宽，再让任务列吸收剩余宽度（延迟一拍，同任务表）
+        self.historyTable.resizeColumnsToContents()
+        QTimer.singleShot(0, self._history_stretch)

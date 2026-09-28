@@ -214,10 +214,11 @@ class BiSyncRunThread(QThread):
                 added=stats.get("added", 0),
                 updated=stats.get("updated", 0),
                 downloaded=stats.get("downloaded", 0),
-                deleted=stats.get("deleted_remote", 0)
-                + stats.get("deleted_local", 0),
+                deleted_remote=stats.get("deleted_remote", 0),
+                deleted_local=stats.get("deleted_local", 0),
                 conflicts=stats.get("conflicts", 0),
                 failed=stats.get("failed", 0),
+                skipped=stats.get("skipped", 0),
                 status=status,
                 message=message,
             )

@@ -192,19 +192,21 @@ class Database:
                 );
 
                 CREATE TABLE IF NOT EXISTS bi_sync_history (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id      INTEGER NOT NULL DEFAULT 0,
-                    job_name    TEXT NOT NULL DEFAULT '',
-                    started_at  TEXT NOT NULL,
-                    finished_at TEXT NOT NULL DEFAULT '',
-                    added       INTEGER NOT NULL DEFAULT 0,
-                    updated     INTEGER NOT NULL DEFAULT 0,
-                    downloaded  INTEGER NOT NULL DEFAULT 0,
-                    deleted     INTEGER NOT NULL DEFAULT 0,
-                    conflicts   INTEGER NOT NULL DEFAULT 0,
-                    failed      INTEGER NOT NULL DEFAULT 0,
-                    status      TEXT NOT NULL DEFAULT 'completed',
-                    message     TEXT NOT NULL DEFAULT ''
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id         INTEGER NOT NULL DEFAULT 0,
+                    job_name       TEXT NOT NULL DEFAULT '',
+                    started_at     TEXT NOT NULL,
+                    finished_at    TEXT NOT NULL DEFAULT '',
+                    added          INTEGER NOT NULL DEFAULT 0,
+                    updated        INTEGER NOT NULL DEFAULT 0,
+                    downloaded     INTEGER NOT NULL DEFAULT 0,
+                    deleted_remote INTEGER NOT NULL DEFAULT 0,
+                    deleted_local  INTEGER NOT NULL DEFAULT 0,
+                    conflicts      INTEGER NOT NULL DEFAULT 0,
+                    failed         INTEGER NOT NULL DEFAULT 0,
+                    skipped        INTEGER NOT NULL DEFAULT 0,
+                    status         TEXT NOT NULL DEFAULT 'completed',
+                    message        TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS bi_sync_state (
@@ -219,6 +221,38 @@ class Database:
                 """
             )
             self._conn.commit()
+            self._migrate_bi_sync_history()
+
+    def _migrate_bi_sync_history(self):
+        """旧库 bi_sync_history 补齐拆分后的删除/跳过列（幂等）。
+
+        旧表仅有合并的 deleted 列（无法区分删云端/删本地），
+        迁移时新列均补 0，旧 deleted 列保留但不再读写。
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute(
+                "PRAGMA table_info(bi_sync_history)"
+            ).fetchall()
+        }
+        if not columns:
+            return
+        if "deleted_remote" not in columns:
+            self._conn.execute(
+                "ALTER TABLE bi_sync_history ADD COLUMN"
+                " deleted_remote INTEGER NOT NULL DEFAULT 0"
+            )
+        if "deleted_local" not in columns:
+            self._conn.execute(
+                "ALTER TABLE bi_sync_history ADD COLUMN"
+                " deleted_local INTEGER NOT NULL DEFAULT 0"
+            )
+        if "skipped" not in columns:
+            self._conn.execute(
+                "ALTER TABLE bi_sync_history ADD COLUMN"
+                " skipped INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.commit()
 
     def execute(self, sql, params=()):
         """执行写操作（自动提交）。"""

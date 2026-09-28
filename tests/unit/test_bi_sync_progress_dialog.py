@@ -19,6 +19,7 @@ from src.app.common.bi_sync_events import (
 from src.app.view.bi_sync_progress_dialog import (
     BiSyncItemTableModel,
     BiSyncProgressController,
+    BiSyncProgressWindow,
 )
 
 
@@ -201,3 +202,77 @@ class TestBiSyncProgressWindow:
         assert window.segmented.isVisible()
         controller.shutdown()
         qapp.processEvents()
+
+
+class TestBiSyncProgressWindowPlacement:
+    def _cleanup(self, qapp, *widgets):
+        for widget in widgets:
+            widget.hide()
+            widget.deleteLater()
+        qapp.processEvents()
+
+    def test_aligned_to_main_window_bottom_centered(self, qapp):
+        """主窗口可见时：底边重合、水平居中（主窗口足够宽避免钳制）。"""
+        main = QWidget()
+        main.setGeometry(100, 100, 600, 500)
+        main.show()
+        window = BiSyncProgressWindow(main_window=main)
+        # offscreen 屏幕仅 800x800，放宽产品端 820x500 最小尺寸约束以便小窗测试
+        window.setMinimumSize(0, 0)
+        window.resize(400, 300)
+        window.present()
+
+        main_frame = main.frameGeometry()
+        win_frame = window.frameGeometry()
+        assert abs(win_frame.bottom() - main_frame.bottom()) <= 2
+        assert abs(win_frame.center().x() - main_frame.center().x()) <= 2
+        self._cleanup(qapp, window, main)
+
+    def test_falls_back_to_screen_center_when_main_hidden(self, qapp):
+        """主窗口隐藏（静默同步）时回退屏幕居中。"""
+        from PySide6.QtGui import QGuiApplication
+
+        main = QWidget()
+        main.hide()
+        window = BiSyncProgressWindow(main_window=main)
+        window.present()
+
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        center = window.frameGeometry().center()
+        assert abs(center.x() - screen.center().x()) <= 2
+        assert abs(center.y() - screen.center().y()) <= 2
+        self._cleanup(qapp, window, main)
+
+    def test_falls_back_without_main_window(self, qapp):
+        """无主窗口引用（无 parent 控制器）时回退屏幕居中。"""
+        from PySide6.QtGui import QGuiApplication
+
+        window = BiSyncProgressWindow()
+        window.present()
+
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        center = window.frameGeometry().center()
+        assert abs(center.x() - screen.center().x()) <= 2
+        assert abs(center.y() - screen.center().y()) <= 2
+        self._cleanup(qapp, window)
+
+    def test_clamped_into_screen_when_main_is_small(self, qapp):
+        """主窗口过小时详情窗钳制在屏幕可用区域内，完整可见。"""
+        from PySide6.QtGui import QGuiApplication
+
+        main = QWidget()
+        main.setGeometry(50, 50, 300, 200)
+        main.show()
+        window = BiSyncProgressWindow(main_window=main)
+        window.setMinimumSize(0, 0)
+        window.resize(700, 600)
+        window.present()
+
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        # 窗口显示后 frame 会向四周扩展几像素（平台边框），留 4px 容差
+        frame = window.frameGeometry()
+        assert frame.left() >= screen.left() - 4
+        assert frame.top() >= screen.top() - 4
+        assert frame.right() <= screen.right() + 4
+        assert frame.bottom() <= screen.bottom() + 4
+        self._cleanup(qapp, window, main)

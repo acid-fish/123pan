@@ -182,16 +182,16 @@ class BiSyncStore:
 
     def add_history(
         self, job_id, job_name, started_at, finished_at="",
-        added=0, updated=0, downloaded=0, deleted=0, conflicts=0,
-        failed=0, status="completed", message="",
+        added=0, updated=0, downloaded=0, deleted_remote=0, deleted_local=0,
+        conflicts=0, failed=0, skipped=0, status="completed", message="",
     ):
         """记录一次双向同步运行结果。"""
         self._db.execute(
             """INSERT INTO bi_sync_history
                (job_id, job_name, started_at, finished_at,
-                added, updated, downloaded, deleted, conflicts,
-                failed, status, message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                added, updated, downloaded, deleted_remote, deleted_local,
+                conflicts, failed, skipped, status, message)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(job_id),
                 job_name,
@@ -200,9 +200,11 @@ class BiSyncStore:
                 int(added),
                 int(updated),
                 int(downloaded),
-                int(deleted),
+                int(deleted_remote),
+                int(deleted_local),
                 int(conflicts),
                 int(failed),
+                int(skipped),
                 status,
                 message,
             ),

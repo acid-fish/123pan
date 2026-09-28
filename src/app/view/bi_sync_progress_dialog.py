@@ -494,10 +494,15 @@ class BiSyncRunPage(QWidget):
 
 
 class BiSyncProgressWindow(QDialog):
-    """可移动、非模态、不置顶的双向同步详情窗口。"""
+    """可移动、非模态、不置顶的双向同步详情窗口。
 
-    def __init__(self):
+    main_window 仅用于初始定位（底边对齐主窗口底边、水平居中），
+    不作为 QDialog 父窗口，保证主窗口隐藏时详情窗仍可独立显示。
+    """
+
+    def __init__(self, main_window=None):
         super().__init__(None)
+        self._main_window = main_window
         self._pages = {}
         self._pages_by_job = {}
         self._pages_by_route = {}
@@ -575,9 +580,13 @@ class BiSyncProgressWindow(QDialog):
 
     def present(self):
         if not self._was_shown:
-            self.__center_on_current_screen()
+            self.__place_initial()
+            self.show()
+            # 显示后边框尺寸已知，基于真实 frame 二次精确定位
+            self.__refine_placement()
             self._was_shown = True
-        self.show()
+        else:
+            self.show()
         self.raise_()
 
     def shutdown(self):
@@ -624,7 +633,75 @@ class BiSyncProgressWindow(QDialog):
         if page is not None:
             self.stack.setCurrentWidget(page)
 
+    def __place_initial(self):
+        """计算初始位置：底边与主窗口底边重合、水平居中。
+
+        主窗口不可见（静默同步场景）或最小化时回退屏幕居中；
+        详情窗超出屏幕可用区域时钳制到屏幕内，保证完整可见。
+        显示前 frame 边框尺寸未知，仅粗定位；显示后由
+        __refine_placement 基于真实 frame 精确修正。
+        """
+        main = self._main_window
+        if (
+            main is not None
+            and main.isVisible()
+            and not main.isMinimized()
+        ):
+            main_frame = main.frameGeometry()
+            screen = QGuiApplication.screenAt(main_frame.center())
+            if screen is None:
+                screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                # 水平居中；底边重合（未显示时 frameGeometry 不含边框，
+                # 误差为边框厚度，像素级不可察觉）
+                x = main_frame.center().x() - self.width() // 2
+                y = main_frame.bottom() + 1 - self.height()
+                x = max(
+                    available.left(),
+                    min(x, available.right() + 1 - self.width()),
+                )
+                y = max(
+                    available.top(),
+                    min(y, available.bottom() + 1 - self.height()),
+                )
+                self.move(x, y)
+                return
+        self.__center_on_current_screen()
+
+    def __refine_placement(self):
+        """显示后基于真实 frame 修正位置，精确对齐主窗口底边与水平中心。"""
+        main = self._main_window
+        if (
+            main is None
+            or not main.isVisible()
+            or main.isMinimized()
+        ):
+            return
+        main_frame = main.frameGeometry()
+        frame = self.frameGeometry()
+        dx = main_frame.center().x() - frame.center().x()
+        dy = main_frame.bottom() - frame.bottom()
+        if not (dx or dy):
+            return
+        screen = QGuiApplication.screenAt(main_frame.center())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        left = max(
+            available.left(),
+            min(frame.left() + dx, available.right() + 1 - frame.width()),
+        )
+        top = max(
+            available.top(),
+            min(frame.top() + dy, available.bottom() + 1 - frame.height()),
+        )
+        self.move(self.x() + (left - frame.left()), self.y() + (top - frame.top()))
+
     def __center_on_current_screen(self):
+        """回退定位：在鼠标所在屏幕居中（主窗口不可见时）。"""
         screen = QGuiApplication.screenAt(QCursor.pos())
         if screen is None:
             screen = QGuiApplication.primaryScreen()
@@ -688,5 +765,7 @@ class BiSyncProgressController(QObject):
 
     def __ensure_window(self):
         if self._window is None:
-            self._window = BiSyncProgressWindow()
+            parent = self.parent()
+            main_window = parent if isinstance(parent, QWidget) else None
+            self._window = BiSyncProgressWindow(main_window=main_window)
         return self._window
