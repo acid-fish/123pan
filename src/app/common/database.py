@@ -216,12 +216,31 @@ class Database:
                     local_mtime     INTEGER,
                     remote_size     INTEGER NOT NULL DEFAULT 0,
                     remote_updateat INTEGER,
+                    is_dir          INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (job_id, rel_path)
                 );
                 """
             )
             self._conn.commit()
             self._migrate_bi_sync_history()
+            self._migrate_bi_sync_state()
+
+    def _migrate_bi_sync_state(self):
+        """旧库 bi_sync_state 补齐 is_dir 列（幂等）。"""
+        columns = {
+            row["name"]
+            for row in self._conn.execute(
+                "PRAGMA table_info(bi_sync_state)"
+            ).fetchall()
+        }
+        if not columns:
+            return
+        if "is_dir" not in columns:
+            self._conn.execute(
+                "ALTER TABLE bi_sync_state ADD COLUMN"
+                " is_dir INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.commit()
 
     def _migrate_bi_sync_history(self):
         """旧库 bi_sync_history 补齐拆分后的删除/跳过列（幂等）。

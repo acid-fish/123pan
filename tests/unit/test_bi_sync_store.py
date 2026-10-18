@@ -109,14 +109,22 @@ class TestState:
         )
         store.set_state(job_id, "a.txt", 10, 100, 10, 200)
         store.set_state(job_id, "b.txt", 20, None, 20, None)
+        store.set_state(job_id, "sub_dir", 0, None, 0, None, is_dir=True)
         state = store.get_state(job_id)
         assert state["a.txt"] == {
             "local_size": 10, "local_mtime": 100,
             "remote_size": 10, "remote_updateat": 200,
+            "is_dir": False,
         }
         assert state["b.txt"] == {
             "local_size": 20, "local_mtime": None,
             "remote_size": 20, "remote_updateat": None,
+            "is_dir": False,
+        }
+        assert state["sub_dir"] == {
+            "local_size": 0, "local_mtime": None,
+            "remote_size": 0, "remote_updateat": None,
+            "is_dir": True,
         }
 
     def test_set_state_overwrite(self, tmp_db):

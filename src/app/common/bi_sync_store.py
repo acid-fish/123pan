@@ -235,8 +235,9 @@ class BiSyncStore:
     def set_state(
         self, job_id, rel_path,
         local_size, local_mtime, remote_size, remote_updateat,
+        is_dir=False,
     ):
-        """记录文件两端的版本快照。
+        """记录文件或目录两端的版本快照。
 
         local_mtime / remote_updateat 允许为 None（未知）：
         上传后云端时间戳未知，先记 None，下次扫描时用远端索引补齐。
@@ -244,8 +245,8 @@ class BiSyncStore:
         self._db.execute(
             """INSERT OR REPLACE INTO bi_sync_state
                (job_id, rel_path, local_size, local_mtime,
-                remote_size, remote_updateat)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+                remote_size, remote_updateat, is_dir)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(job_id),
                 rel_path,
@@ -253,13 +254,14 @@ class BiSyncStore:
                 local_mtime,
                 int(remote_size),
                 remote_updateat,
+                1 if is_dir else 0,
             ),
         )
 
     def get_state(self, job_id):
-        """获取任务的全部版本快照：{rel_path: {local_size, local_mtime, remote_size, remote_updateat}}。"""
+        """获取任务的全部版本快照：{rel_path: {local_size, local_mtime, remote_size, remote_updateat, is_dir}}。"""
         rows = self._db.query(
-            "SELECT rel_path, local_size, local_mtime, remote_size, remote_updateat"
+            "SELECT rel_path, local_size, local_mtime, remote_size, remote_updateat, is_dir"
             " FROM bi_sync_state WHERE job_id = ?",
             (int(job_id),),
         )
@@ -269,6 +271,7 @@ class BiSyncStore:
                 "local_mtime": row["local_mtime"],
                 "remote_size": int(row["remote_size"] or 0),
                 "remote_updateat": row["remote_updateat"],
+                "is_dir": bool(row["is_dir"]) if "is_dir" in row.keys() else False,
             }
             for row in rows
         }
