@@ -355,6 +355,83 @@ class TestComputeDirs:
         assert plan["type_conflicts"] == ["sub"]
         assert plan["push_uploads"] == []
 
+    def test_empty_dir_both_exist_populates_state(self, tmp_db):
+        svc = _make_svc()
+        local = {"sub": _local_dir()}
+        remote = {"sub": _remote_dir()}
+        plan = svc.compute_bi_changes(_make_job(), local, remote)
+        assert plan["push_dirs"] == []
+        assert plan["pull_dirs"] == []
+        st = svc._store.get_state(1).get("sub")
+        assert st is not None
+        assert st["is_dir"] == 1
+
+    def test_empty_dir_local_deleted_propagates_to_remote(self, tmp_db):
+        svc = _make_svc()
+        svc._store.set_state(1, "empty_dir", 0, 100, 0, 200, is_dir=True)
+        remote = {"empty_dir": _remote_dir()}
+        plan = svc.compute_bi_changes(_make_job(delete_remote=1), {}, remote)
+        assert "empty_dir" in plan["delete_remote"]
+
+    def test_empty_dir_local_deleted_retains_if_delete_remote_disabled(self, tmp_db):
+        svc = _make_svc()
+        svc._store.set_state(1, "empty_dir", 0, 100, 0, 200, is_dir=True)
+        remote = {"empty_dir": _remote_dir()}
+        plan = svc.compute_bi_changes(_make_job(delete_remote=0), {}, remote)
+        assert plan["delete_remote"] == []
+        assert "empty_dir" in plan["keep_remote"]
+
+    def test_empty_dir_remote_deleted_propagates_to_local(self, tmp_db):
+        svc = _make_svc()
+        svc._store.set_state(1, "empty_dir", 0, 100, 0, 200, is_dir=True)
+        local = {"empty_dir": _local_dir()}
+        plan = svc.compute_bi_changes(_make_job(delete_local=1), local, {})
+        assert "empty_dir" in plan["delete_local"]
+
+    def test_empty_dir_remote_deleted_retains_if_delete_local_disabled(self, tmp_db):
+        svc = _make_svc()
+        svc._store.set_state(1, "empty_dir", 0, 100, 0, 200, is_dir=True)
+        local = {"empty_dir": _local_dir()}
+        plan = svc.compute_bi_changes(_make_job(delete_local=0), local, {})
+        assert plan["delete_local"] == []
+        assert "empty_dir" in plan["keep_local"]
+
+    def test_parent_dir_delete_protected_if_surviving_child_local(self, tmp_db):
+        svc = _make_svc()
+        # 云端删除了 parent_dir，但本地 parent_dir 下有存活文件 child.txt
+        svc._store.set_state(1, "parent", 0, 100, 0, 200, is_dir=True)
+        local = {"parent": _local_dir(), "parent/child.txt": _local_file()}
+        plan = svc.compute_bi_changes(_make_job(delete_local=1), local, {})
+        # parent 绝不能被加入 delete_local，且应 push_dirs 重建到云端
+        assert "parent" not in plan["delete_local"]
+        assert ("parent", "") in plan["push_dirs"]
+        assert [r for r, _, _, _ in plan["push_uploads"]] == ["parent/child.txt"]
+
+    def test_parent_dir_delete_protected_if_surviving_child_remote(self, tmp_db):
+        svc = _make_svc()
+        # 本地删除了 parent_dir，但云端 parent_dir 下有存活文件 child.txt
+        svc._store.set_state(1, "parent", 0, 100, 0, 200, is_dir=True)
+        remote = {"parent": _remote_dir(), "parent/child.txt": _remote_file()}
+        plan = svc.compute_bi_changes(_make_job(delete_remote=1), {}, remote)
+        # parent 绝不能被加入 delete_remote，且应 pull_dirs 重建到本地
+        assert "parent" not in plan["delete_remote"]
+        assert "parent" in plan["pull_dirs"]
+        assert [r for r, _ in plan["pull_downloads"]] == ["parent/child.txt"]
+
+    def test_nested_empty_dirs_deleted_bottom_up(self, tmp_db):
+        svc = _make_svc()
+        svc._store.set_state(1, "a", 0, 100, 0, 200, is_dir=True)
+        svc._store.set_state(1, "a/b", 0, 100, 0, 200, is_dir=True)
+        svc._store.set_state(1, "a/b/c", 0, 100, 0, 200, is_dir=True)
+        # 本地删除了 a, a/b, a/b/c，远端仍然存在
+        remote = {
+            "a": _remote_dir(fid=1),
+            "a/b": _remote_dir(fid=2),
+            "a/b/c": _remote_dir(fid=3),
+        }
+        plan = svc.compute_bi_changes(_make_job(delete_remote=1), {}, remote)
+        assert plan["delete_remote"] == ["a/b/c", "a/b", "a"]
+
     def test_stale_state_cleaned_when_both_gone(self, tmp_db):
         svc = _make_svc()
         svc._store.set_state(1, "ghost.txt", 1, 1, 1, 1)
@@ -795,3 +872,91 @@ class TestRunEventsAndSafety:
         ]
         assert failed[-1].status == BiSyncItemStatus.FAILED
         assert "recycle bin unavailable" in failed[-1].message
+
+    def test_run_bi_sync_empty_dir_lifecycle(self, tmp_db, tmp_path):
+        root = tmp_path / "local"
+        root.mkdir(exist_ok=True)
+        empty_dir = root / "empty_dir"
+        empty_dir.mkdir()
+
+        svc = _make_svc()
+        remote_state = {}
+
+        def mock_create_folder(name, parent_id):
+            fid = 101
+            remote_state[name] = {"FileId": fid, "FileName": name, "Type": 1}
+            return fid, ""
+
+        def mock_trash(item, operation=True):
+            for k, v in list(remote_state.items()):
+                if v["FileId"] == item.get("FileId"):
+                    del remote_state[k]
+            return SimpleNamespace(code=0)
+
+        svc._file.create_folder = MagicMock(side_effect=mock_create_folder)
+        svc._session.trash_file = MagicMock(side_effect=mock_trash)
+        svc.build_remote_index = MagicMock(side_effect=lambda _: dict(remote_state))
+
+        job = _make_job(local_path=str(root), delete_remote=1, delete_local=1)
+
+        # 第一次同步：本地空目录应推送到云端并记录快照
+        ok, stats = svc.run_bi_sync(job)
+        assert ok is True
+        assert svc._file.create_folder.call_count == 1
+        st = svc._store.get_state(job["id"]).get("empty_dir")
+        assert st is not None
+        assert st["is_dir"] is True
+
+        # 第二次同步：两端未变，无操作
+        ok, stats = svc.run_bi_sync(job)
+        assert ok is True
+        assert stats["deleted_remote"] == 0
+        assert stats["deleted_local"] == 0
+
+        # 用户在本地删除了空目录
+        empty_dir.rmdir()
+        assert not empty_dir.exists()
+
+        # 第三次同步：远端空目录应被删除并从快照清除
+        ok, stats = svc.run_bi_sync(job)
+        assert ok is True
+        assert stats["deleted_remote"] == 1
+        assert "empty_dir" not in remote_state
+        assert "empty_dir" not in svc._store.get_state(job["id"])
+
+    def test_run_bi_sync_empty_dir_remote_to_local_delete(self, tmp_db, tmp_path):
+        root = tmp_path / "local"
+        root.mkdir(exist_ok=True)
+
+        svc = _make_svc()
+        remote_state = {
+            "cloud_empty": {"FileId": 201, "FileName": "cloud_empty", "Type": 1}
+        }
+        svc.build_remote_index = MagicMock(side_effect=lambda _: dict(remote_state))
+
+        job = _make_job(local_path=str(root), delete_remote=1, delete_local=1)
+
+        # 第一次同步：云端空目录拉取到本地创建
+        ok, stats = svc.run_bi_sync(job)
+        assert ok is True
+        local_dir = root / "cloud_empty"
+        assert local_dir.is_dir()
+        st = svc._store.get_state(job["id"]).get("cloud_empty")
+        assert st is not None
+        assert st["is_dir"] is True
+
+        # 第二次同步：两端未变
+        ok, stats = svc.run_bi_sync(job)
+        assert ok is True
+        assert stats["deleted_local"] == 0
+
+        # 云端删除了空目录
+        del remote_state["cloud_empty"]
+
+        # 第三次同步：本地空目录被删除并清除快照
+        ok, stats = svc.run_bi_sync(job)
+        assert ok is True
+        assert stats["deleted_local"] == 1
+        assert not local_dir.exists()
+        assert "cloud_empty" not in svc._store.get_state(job["id"])
+

@@ -127,6 +127,24 @@ class BiSyncService(SyncService):
 
     # ---- 变更计算 ----
 
+    @staticmethod
+    def _has_local_surviving_children(rel, local_index, delete_local_set):
+        """检查 local_index 中在 rel 目录下是否存在不会被删除的项。"""
+        prefix = f"{rel}/"
+        for k in local_index:
+            if k.startswith(prefix) and k not in delete_local_set:
+                return True
+        return False
+
+    @staticmethod
+    def _has_remote_surviving_children(rel, remote_index, delete_remote_set):
+        """检查 remote_index 中在 rel 目录下是否存在不会被删除的项。"""
+        prefix = f"{rel}/"
+        for k in remote_index:
+            if k.startswith(prefix) and k not in delete_remote_set:
+                return True
+        return False
+
     def compute_bi_changes(self, job, local_index, remote_index):
         """对比本地/云端索引与状态快照，生成双向同步计划。
 
@@ -169,21 +187,23 @@ class BiSyncService(SyncService):
             "type_conflicts": [],
         }
 
+        file_keys = []
+        dir_keys = []
+
         for rel in set(local_index) | set(remote_index) | set(state):
             local = local_index.get(rel)
             remote = remote_index.get(rel)
             st = state.get(rel)
-            parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-
-            local_is_file = local is not None and not local["is_dir"]
-            local_is_dir = local is not None and local["is_dir"]
-            remote_is_dir = remote is not None and int(remote.get("Type", 0)) == 1
-            remote_is_file = remote is not None and not remote_is_dir
 
             # 两端都消失：清理残留快照
             if local is None and remote is None:
                 self._store.remove_state(job_id, rel)
                 continue
+
+            local_is_file = local is not None and not local["is_dir"]
+            local_is_dir = local is not None and local["is_dir"]
+            remote_is_dir = remote is not None and int(remote.get("Type", 0)) == 1
+            remote_is_file = remote is not None and not remote_is_dir
 
             # 文件/目录同名冲突：跳过并计失败，避免破坏任何一侧数据
             if (local_is_file and remote_is_dir) or (
@@ -192,15 +212,19 @@ class BiSyncService(SyncService):
                 plan["type_conflicts"].append(rel)
                 continue
 
-            # 目录：只做结构性补齐（创建缺失的一侧），不参与版本跟踪
-            if local_is_dir:
-                if remote is None:
-                    plan["push_dirs"].append((rel, parent_rel))
-                continue
-            if remote_is_dir:
-                if local is None:
-                    plan["pull_dirs"].append(rel)
-                continue
+            if local_is_dir or remote_is_dir:
+                dir_keys.append(rel)
+            else:
+                file_keys.append(rel)
+
+        for rel in file_keys:
+            local = local_index.get(rel)
+            remote = remote_index.get(rel)
+            st = state.get(rel)
+            parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+
+            local_is_file = local is not None and not local["is_dir"]
+            remote_is_file = remote is not None and int(remote.get("Type", 0)) == 0
 
             # 首次接触且两端内容一致：直接对齐快照，不产生任何传输
             if (
@@ -277,6 +301,68 @@ class BiSyncService(SyncService):
             else:
                 # 检测到本地删除，但当前任务未启用云端删除传播。
                 plan["keep_remote"].append(rel)
+
+        del_local_set = set(plan["delete_local"])
+        del_remote_set = set(plan["delete_remote"])
+        dir_keys_sorted = sorted(dir_keys, key=lambda x: -x.count("/"))
+
+        for rel in dir_keys_sorted:
+            local = local_index.get(rel)
+            remote = remote_index.get(rel)
+            st = state.get(rel)
+            parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+
+            local_is_dir = local is not None and local["is_dir"]
+            remote_is_dir = remote is not None and int(remote.get("Type", 0)) == 1
+
+            if local_is_dir and remote_is_dir:
+                # 两端均存在目录：若快照未记录则补齐
+                if st is None:
+                    self._store.set_state(
+                        job_id, rel, 0, local.get("mtime"), 0,
+                        self._remote_updateat(remote), is_dir=True,
+                    )
+                continue
+
+            if local_is_dir:
+                # 本地存在，云端不存在
+                if st is None:
+                    # 本地新建目录：推送到云端创建
+                    plan["push_dirs"].append((rel, parent_rel))
+                elif delete_local:
+                    # 快照存在且启用了本地删除：云端已删
+                    # 仅当本地没有存活子项（纯空目录或所有子项都在待删列表）时删除本地
+                    if not self._has_local_surviving_children(
+                        rel, local_index, del_local_set
+                    ):
+                        plan["delete_local"].append(rel)
+                        del_local_set.add(rel)
+                    else:
+                        # 本地有保留内容，保护本地目录不被删除，并在云端重建此目录以承载子项
+                        plan["push_dirs"].append((rel, parent_rel))
+                else:
+                    plan["keep_local"].append(rel)
+                continue
+
+            if remote_is_dir:
+                # 云端存在，本地不存在
+                if st is None:
+                    # 云端新建目录：拉取到本地创建
+                    plan["pull_dirs"].append(rel)
+                elif delete_remote:
+                    # 快照存在且启用了云端删除：本地已删
+                    # 仅当云端没有存活子项时删除云端
+                    if not self._has_remote_surviving_children(
+                        rel, remote_index, del_remote_set
+                    ):
+                        plan["delete_remote"].append(rel)
+                        del_remote_set.add(rel)
+                    else:
+                        # 云端有保留内容，保护云端目录不被删除，并在本地重建此目录以承载子项
+                        plan["pull_dirs"].append(rel)
+                else:
+                    plan["keep_remote"].append(rel)
+                continue
 
         return plan
 
@@ -565,6 +651,10 @@ class BiSyncService(SyncService):
             remote_index.setdefault(rel, {"FileId": fid, "Type": 1})
             _progress_item(action, rel, 1, 1)
             _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
+            local = local_index.get(rel) or {}
+            self._store.set_state(
+                job_id, rel, 0, local.get("mtime"), 0, None, is_dir=True
+            )
             logger.debug("双向同步已创建云端目录: %s", rel)
 
         # 5. 上传本地变化
@@ -650,6 +740,11 @@ class BiSyncService(SyncService):
                 target.mkdir(parents=True, exist_ok=True)
                 _progress_item(action, rel, 1, 1)
                 _finish_item(action, rel, BiSyncItemStatus.COMPLETED)
+                remote = remote_index.get(rel) or {}
+                self._store.set_state(
+                    job_id, rel, 0, int(target.stat().st_mtime), 0,
+                    self._remote_updateat(remote), is_dir=True,
+                )
             except OSError as e:
                 logger.error("双向同步建本地目录失败: %s (%s)", rel, e)
                 stats["failed"] += 1
